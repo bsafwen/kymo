@@ -15,7 +15,7 @@ See how your Windows PC performs, right now and over months and years. One small
 
 - **History of everything:** CPU (overall, per logical processor, clock, power, performance limit), memory, commit and paging, disks, network adapters, NVIDIA GPU, and every app per minute (CPU, memory, commit, I/O, instances).
 - **Dashboards:** This PC, Apps, Process explorer and Settings. Pick a range or drag to zoom, from 15 minutes to 2 years.
-- **Desktop card:** live figures, the last hour, top apps, and an alert line when something needs attention (CPU, memory, commit, disk, GPU heat). Drag it anywhere on the desktop, resize it by its edges, and choose what it shows.
+- **Desktop card:** live figures, the last hour, top apps, and an alert line when something needs attention (CPU, memory, commit, disk, GPU heat). Drag it anywhere on the desktop, stretch it by an edge or scale it by a corner, set its transparency with Shift + scroll, and choose what it shows.
 - **Settings in the browser:** sample interval (1 s to 1 min), what to record, retention per tier, a size ceiling, alert thresholds, what the desktop card shows, clearing history. Only valid values can be chosen.
 - **Always on:** a Windows service that starts at boot, restarts after a crash or a hang, and listens on 127.0.0.1 only.
 

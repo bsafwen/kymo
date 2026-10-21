@@ -6,14 +6,16 @@
 // 10 seconds (every 30 seconds after 5 minutes without input), and only while it can be seen: covered
 // by windows, locked, or with the screen off, it neither fetches nor draws. Click the card to open the
 // dashboards, right-click it for its settings (what it shows: the recorder's Settings page, see Look). Drag
-// it to move it, drag its edges or Ctrl + scroll over it to resize it (its place and size:
-// %LOCALAPPDATA%\Kymo\card-placement.txt, see Spot). Built with the C# compiler that ships with Windows
+// it to move it; drag an edge to make it wider or taller (its text keeps its size), a corner or Ctrl + scroll
+// over it to make all of it bigger or smaller (its place and size: %LOCALAPPDATA%\Kymo\card-placement.txt,
+// see Spot). Shift + scroll over it sets its background opacity (a setting of the recorder's, sent there). Built with the C# compiler that ships with Windows
 // (C# 5, .NET Framework 4.8): see build.ps1.
 // Log: %LOCALAPPDATA%\Kymo\card.log
 //
 // KymoCard.exe                      run (one instance per user session)
 // KymoCard.exe --snapshot out.png [key=value ...]   render one card to a PNG and exit (for checks), with
-//                                   settings to try (as in /api/card "card": columns=3 charts=false)
+//                                   settings to try (as in /api/card "card": columns=3 charts=false;
+//                                   wider=120 taller=60 for a card stretched by its edges)
 // KymoCard.exe --selftest <folder>  check moving the card with a second card (exit code: failed checks)
 // KymoCard.exe --trace              also log every fetch and every pause/resume
 // KymoCard.exe --trace --always-visible   fetch and draw even while covered (to check the timing)
@@ -255,6 +257,7 @@ namespace Kymo
         public readonly Dictionary<string, double> Limits = new Dictionary<string, double>(Source.DefaultLimits);
         public Look Look = new Look();
         public bool HasLook;                   // the answer carried the card's settings (else the last ones stay)
+        public long Serial;                    // which fetch it answers (1, 2, ...; 0 for none)
         public double Get(string k) { double v; return V.TryGetValue(k, out v) ? v : double.NaN; }
         public double Lim(string k) { double v; return Limits.TryGetValue(k, out v) ? v : double.NaN; }
     }
@@ -307,6 +310,28 @@ namespace Kymo
             using (var resp = req.GetResponse())
             using (var r = new StreamReader(resp.GetResponseStream()))
                 return r.ReadToEnd();
+        }
+
+        // A change to the recorder's settings (form body key=value), sent as its own page sends it (X-Kymo: 1). The HTTP
+        // status, or 0 when the recorder cannot be reached.
+        public static int Post(string path, string body)
+        {
+            var req = (HttpWebRequest)WebRequest.Create(Base + path);
+            req.Method = "POST"; req.Proxy = null; req.Timeout = 5000; req.ReadWriteTimeout = 5000;
+            req.ServicePoint.Expect100Continue = false;
+            req.ContentType = "application/x-www-form-urlencoded";
+            req.Headers["X-Kymo"] = "1";
+            var bytes = Encoding.ASCII.GetBytes(body);
+            try
+            {
+                using (var st = req.GetRequestStream()) st.Write(bytes, 0, bytes.Length);
+                using (var resp = (HttpWebResponse)req.GetResponse()) return (int)resp.StatusCode;
+            }
+            catch (WebException e)
+            {
+                var r = e.Response as HttpWebResponse;
+                return r != null ? (int)r.StatusCode : 0;
+            }
         }
 
         static Dictionary<string, object> Map(Dictionary<string, object> m, string k)
@@ -534,8 +559,9 @@ namespace Kymo
         // Lines below the tiles: the top apps (on two lines when the card is one tile wide) and the status.
         static int FootLines(Look look) { return (look.TopApps ? (look.Columns <= 1 ? 2 : 1) : 0) + (look.Status ? 1 : 0); }
 
-        // The card's size at scale k with `lines` issue lines: Render's layout, without drawing.
-        public static Size Measure(Look look, int lines, float k)
+        // The card's size at scale k with `lines` issue lines: Render's layout, without drawing. `wider` and `taller`:
+        // the room added by dragging its edges (logical px at 100 %, so they scale with the card).
+        public static Size Measure(Look look, int lines, float k, double wider = 0, double taller = 0)
         {
             Func<float, float> S = v => v * k;
             int cols = Math.Max(1, Math.Min(3, look.Columns));
@@ -543,11 +569,13 @@ namespace Kymo
             float gap = S(10), tileH = S(look.Charts ? 96 : 62);
             float tilesH = rows > 0 ? S(6) + rows * tileH + (rows - 1) * gap : 0;
             float footH = FootLines(look) * S(20);
-            return new Size((int)Math.Ceiling(S(WidthFor(cols))),
-                (int)Math.Ceiling(S(18) + S(30) + S(10) + S(36) + S(8) + lines * S(24) + tilesH + (footH > 0 ? S(14) + footH : 0) + S(18)));
+            return new Size((int)Math.Ceiling(S(WidthFor(cols) + (float)wider)),
+                (int)Math.Ceiling(S(18) + S(30) + S(10) + S(36) + S(8) + lines * S(24) + tilesH + (footH > 0 ? S(14) + footH : 0) + S(18) + S((float)taller)));
         }
 
-        public static Bitmap Render(Snapshot s, float k)
+        // Wider: the tiles, the bar and the lines widen. Taller: the tiles (and their charts) share the extra height;
+        // without tiles it stays empty at the bottom.
+        public static Bitmap Render(Snapshot s, float k, double wider = 0, double taller = 0)
         {
             var look = s.Look;
             Func<float, float> S = v => v * k;
@@ -556,9 +584,11 @@ namespace Kymo
             var shown = Enumerable.Range(0, 6).Where(i => look.Tiles[i]).ToList();
             int rows = (shown.Count + cols - 1) / cols;
             float pad = S(18), gap = S(10), tileH = S(look.Charts ? 96 : 62);
-            var size = Measure(look, issues.Count, k);
+            var size = Measure(look, issues.Count, k, wider, taller);
             int w = size.Width, h = size.Height;
             float tileW = (w - 2 * pad - (cols - 1) * gap) / cols;
+            float stretch = rows > 0 ? S((float)taller) / rows : 0;   // added to each row of tiles
+            tileH += stretch;
 
             var bmp = new Bitmap(w, h, PixelFormat.Format32bppPArgb);
             using (var g = Graphics.FromImage(bmp))
@@ -627,7 +657,7 @@ namespace Kymo
                         using (var vb = new SolidBrush(Of(t.Item4))) g.DrawString(t.Item2, fValue, vb, x + S(8), ty + S(22));
                         g.DrawString(t.Item3, fSub, dim, new RectangleF(x + S(6), ty + S(9), tileW - S(16), S(18)), right);
                         double[] pts;
-                        if (look.Charts && s.Series.TryGetValue(t.Item5, out pts) && pts.Length >= 4) Spark(g, pts, t.Item6, Of(t.Item4), x + S(8), ty + tileH - S(8), tileW - S(16), S(30), S(1.6f));
+                        if (look.Charts && s.Series.TryGetValue(t.Item5, out pts) && pts.Length >= 4) Spark(g, pts, t.Item6, Of(t.Item4), x + S(8), ty + tileH - S(8), tileW - S(16), S(30) + stretch, S(1.6f));
                     }
                 if (rows > 0) y += rows * tileH + (rows - 1) * gap;
                 y += S(14);
@@ -685,15 +715,17 @@ namespace Kymo
 
     // Where the card sits and how big it is: a corner of a monitor's work area and the card's distance from it,
     // in logical px (96 per inch), so it stays put when the taskbar, the resolution or the scaling changes, and
-    // grows away from its corner when issue lines appear; and its size in % of the usual one. Kept in
-    // card-placement.txt; none means the default, top right at 100 %.
+    // grows away from its corner when issue lines appear; its size in % of the usual one; and the room its edges
+    // were dragged out by (logical px at 100 %). Kept in card-placement.txt; none means the default, top right at
+    // 100 %, as made.
     sealed class Spot
     {
-        public const double Margin = 28, MinSize = 60, MaxSize = 250;
+        public const double Margin = 28, MinSize = 60, MaxSize = 250, MaxRoom = 20000;   // MaxRoom: a sanity bound only
         public string Monitor = "";                  // device name, \\.\DISPLAY1; empty for the primary monitor
         public bool Right = true, Bottom;
         public double X = Margin, Y = Margin;
         public double Size = 100;
+        public double Wider, Taller;
 
         public string Corner { get { return (Bottom ? "bottom" : "top") + "-" + (Right ? "right" : "left"); } }
 
@@ -741,6 +773,11 @@ namespace Kymo
                         if (!double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out v) || !(v >= MinSize && v <= MaxSize)) throw new FormatException("size " + value);
                         s.Size = Math.Round(v);
                     }
+                    else if (key == "wider" || key == "taller")
+                    {
+                        if (!double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out v) || !(v >= 0 && v <= MaxRoom)) throw new FormatException(key + " " + value);
+                        if (key == "wider") s.Wider = Math.Round(v); else s.Taller = Math.Round(v);
+                    }
                 }
                 return s;
             }
@@ -750,11 +787,13 @@ namespace Kymo
         public void Save(string file)
         {
             string text = "# Where the Kymo card sits: the corner of the monitor's work area it keeps its distance from, in\r\n" +
-                "# logical pixels (96 per inch), and its size in % of the usual one. Drag the card to move it, drag its\r\n" +
-                "# edges (or Ctrl + scroll over it) to resize it; delete this file to put it back top right at 100 %.\r\n" +
+                "# logical pixels (96 per inch); its size in % of the usual one; and how much wider and taller than\r\n" +
+                "# made its edges were dragged (logical pixels at 100 %). Drag the card to move it, an edge to stretch it,\r\n" +
+                "# a corner (or Ctrl + scroll over it) to make it bigger or smaller; delete this file to put it back.\r\n" +
                 "monitor=" + Monitor + "\r\ncorner=" + Corner + "\r\n" +
                 "x=" + X.ToString("0.#", CultureInfo.InvariantCulture) + "\r\ny=" + Y.ToString("0.#", CultureInfo.InvariantCulture) + "\r\n" +
-                "size=" + Size.ToString("0", CultureInfo.InvariantCulture) + "\r\n";
+                "size=" + Size.ToString("0", CultureInfo.InvariantCulture) + "\r\n" +
+                "wider=" + Wider.ToString("0", CultureInfo.InvariantCulture) + "\r\ntaller=" + Taller.ToString("0", CultureInfo.InvariantCulture) + "\r\n";
             Write(file, text);
         }
 
@@ -803,13 +842,23 @@ namespace Kymo
         Point pressAt, lastAt, dragPos;
         PointF grab;
         // Resizing: the edges held (1 left, 2 top, 4 right, 8 bottom; two of them at a corner), the card when it
-        // started, and the size it has meanwhile (% of the usual one). Ctrl + scroll saves a second after the last notch.
+        // started, and the size it has meanwhile (% of the usual one) or, held by an edge, the room it is stretched by
+        // (logical px at 100 %). Ctrl + scroll saves a second after the last notch.
         int zone;
         bool resizing;
         Rectangle startRect;
-        double startSize, liveSize;
+        double startSize, liveSize, startWider, startTaller, liveWider, liveTaller;
         double drawnSize = 100;                       // the size last drawn (smaller than its own when it would not fit)
         int wheelDelta;                               // wheel movement not yet turned into whole percents (120 = 10 %)
+        // Shift + scroll: the background opacity, set on the card and sent to the recorder's settings (where the card's
+        // settings live) a second after the last notch. Until the recorder's answers carry it, the card keeps it.
+        int opacityWheel;                             // wheel movement not yet turned into steps (120 = 5 %)
+        int pendingOpacity = -1;                      // set on the card, not yet in the recorder's answers
+        bool sendingOpacity, resendOpacity;
+        long fetchSerial;                             // fetches started so far
+        long confirmedAfter = -1;                     // the recorder took the pending opacity: answers to later fetches carry it
+        readonly System.Windows.Forms.Timer opacitySend = new System.Windows.Forms.Timer { Interval = 1000 };
+        internal static Func<int, int> SendOpacity;   // for --selftest (else: Source.Post; never in a test)
         readonly System.Windows.Forms.Timer wheelSave = new System.Windows.Forms.Timer { Interval = 1000 };
         long draws, fetches, pausedTicks, visibleTicks; double drawMs;
         double statsAt = Clock.Now;
@@ -823,6 +872,7 @@ namespace Kymo
             try { lookSaved = File.Exists(LookFile) ? look.ToText() : ""; } catch { }
             timer.Tick += delegate { Tick(); };
             wheelSave.Tick += delegate { wheelSave.Stop(); wheelDelta = 0; SaveSpot("resized"); };
+            opacitySend.Tick += delegate { SendOpacityNow(); };
             burst.Tick += delegate { KeepAboveDesktop(); if (--burstLeft <= 0 || Topmost(Handle)) burst.Stop(); };
             onForeground = OnForeground;
         }
@@ -886,6 +936,8 @@ namespace Kymo
 
         // The size drawn (% of the usual one), and the drawing scale: the monitor's times that size.
         double SizeNow { get { return resizing ? liveSize : spot.Size; } }
+        double Wider { get { return resizing ? liveWider : spot.Wider; } }
+        double Taller { get { return resizing ? liveTaller : spot.Taller; } }
         float K { get { return (float)(scale * SizeNow / 100); } }
         // Its place and size locked in the settings: no dragging, no resizing.
         bool PlaceLocked { get { return look.Locked; } }
@@ -926,6 +978,7 @@ namespace Kymo
                 resizing = true;
                 startRect = new Rectangle(Origin(), new Size(width, height));
                 startSize = liveSize = Math.Round(drawnSize);   // what is shown: it may be drawn smaller than its size
+                startWider = liveWider = spot.Wider; startTaller = liveTaller = spot.Taller;
                 dragPos = startRect.Location;
             }
             else if (!dragging && width > 0 && height > 0)
@@ -986,8 +1039,10 @@ namespace Kymo
             return Cursors.Default;
         }
 
-        // Held by an edge or a corner at `at`: the card scales as a whole (its content keeps its proportions), from
-        // 60 % to 250 % of the usual size and never beyond the work area, and stops at 100 % when it passes close.
+        // Held by an edge at `at`: the card stretches that way only (wider or taller; its text keeps its size), never
+        // narrower or shorter than made, nor beyond the work area with all its issue lines, and back to as made when it
+        // passes close. Held by a corner: the card scales as a whole (its content keeps its proportions), from 60 % to
+        // 250 % of the usual size and never beyond the work area, and stops at 100 % when it passes close.
         void ResizeTo(Point at)
         {
             if (!Test) Cursor.Current = CursorFor(zone);
@@ -995,8 +1050,32 @@ namespace Kymo
             double nw = w0 + ((zone & 4) != 0 ? at.X - pressAt.X : (zone & 1) != 0 ? pressAt.X - at.X : 0);
             double nh = h0 + ((zone & 8) != 0 ? at.Y - pressAt.Y : (zone & 2) != 0 ? pressAt.Y - at.Y : 0);
             bool across = (zone & 5) != 0, down = (zone & 10) != 0;
+            if (across != down)
+            {
+                // At the scale it is drawn (it may be drawn smaller than its size: like a corner, it starts from what is
+                // shown). The moved edge goes up to the end of the work area; the card keeps room on the screen for all its
+                // issue lines; and it never loses, the moment it is held, room it was stretched by before.
+                double k = scale * startSize / 100;
+                var now = Card.Measure(look, last != null ? Card.Shown(last).Count : 0, (float)k);   // as made, the lines shown
+                var all = Card.Measure(look, Math.Max(0, Math.Min(6, look.IssueLines)), (float)k);   // as made, all its lines
+                double wider = startWider, taller = startTaller;
+                if (across)
+                {
+                    double room = (zone & 1) != 0 ? startRect.Right - work.Left : work.Right - startRect.Left;
+                    wider = Room(startWider + (nw - w0) / k, Math.Max(startWider, (room - now.Width) / k));
+                }
+                else
+                {
+                    double room = (zone & 2) != 0 ? startRect.Bottom - work.Top : work.Bottom - startRect.Top;
+                    taller = Room(startTaller + (nh - h0) / k, Math.Max(startTaller, Math.Min(room - now.Height, work.Height - all.Height) / k));
+                }
+                if (wider == liveWider && taller == liveTaller) return;
+                liveWider = wider; liveTaller = taller;
+                if (last != null) Draw();
+                return;
+            }
             // At a corner, the movement along the card's diagonal counts.
-            double f = across && down ? (nw * w0 + nh * h0) / (w0 * w0 + h0 * h0) : across ? nw / w0 : nh / h0;
+            double f = (nw * w0 + nh * h0) / (w0 * w0 + h0 * h0);
             // Up to what fits, or the size it started at if that is more (it may shrink from there without a jump).
             double fit = FitSize();
             double size = Math.Round(Math.Max(Spot.MinSize, Math.Min(Math.Min(Spot.MaxSize, Math.Max(fit, startSize)), startSize * f)));
@@ -1006,10 +1085,18 @@ namespace Kymo
             if (last != null) Draw();
         }
 
-        // The largest size (%) at which the card fits the work area with as many issue lines as it may show.
+        // Stretched room (logical px at 100 %): none below 0 or within 8 px of it (back to as made), at most `most`.
+        static double Room(double v, double most)
+        {
+            v = Math.Min(Math.Min(v, Spot.MaxRoom), Math.Max(0, Math.Floor(most)));
+            return v < 8 ? 0 : Math.Round(v);
+        }
+
+        // The largest size (%) at which the card fits the work area with as many issue lines as it may show (and the
+        // room its edges were dragged out by).
         double FitSize()
         {
-            var most = Card.Measure(look, Math.Max(0, Math.Min(6, look.IssueLines)), scale);
+            var most = Card.Measure(look, Math.Max(0, Math.Min(6, look.IssueLines)), scale, Wider, Taller);
             return Math.Floor(100 * Math.Min(work.Width / (double)most.Width, work.Height / (double)most.Height));
         }
 
@@ -1037,7 +1124,8 @@ namespace Kymo
             IntPtr mon = Native.MonitorAt(new Point(o.X + width / 2, o.Y + height / 2));
             Rectangle w; float k;
             Area(mon, out w, out k);
-            var s = new Spot { Monitor = Native.DeviceOf(mon), Size = wasResizing ? liveSize : spot.Size };
+            var s = new Spot { Monitor = Native.DeviceOf(mon), Size = wasResizing ? liveSize : spot.Size,
+                Wider = wasResizing ? liveWider : spot.Wider, Taller = wasResizing ? liveTaller : spot.Taller };
             s.Right = o.X + width / 2.0 > w.Left + w.Width / 2.0;
             s.Bottom = o.Y + height / 2.0 > w.Top + w.Height / 2.0;
             s.X = Math.Max(0, Math.Round((s.Right ? w.Right - (o.X + width) : o.X - w.Left) / k, 1));
@@ -1055,7 +1143,9 @@ namespace Kymo
             try { spot.Save(PositionFile); spotStamp = Stamp(); }
             catch (Exception e) { Log("saving the card position: " + e.Message); }
             Log(what + ": " + spot.Corner + " " + spot.X.ToString(CultureInfo.InvariantCulture) + ", " + spot.Y.ToString(CultureInfo.InvariantCulture) +
-                " at " + spot.Size.ToString(CultureInfo.InvariantCulture) + " % on " + spot.Monitor);
+                " at " + spot.Size.ToString(CultureInfo.InvariantCulture) + " %" +
+                (spot.Wider > 0 || spot.Taller > 0 ? ", " + spot.Wider.ToString(CultureInfo.InvariantCulture) + " wider and " + spot.Taller.ToString(CultureInfo.InvariantCulture) + " taller" : "") +
+                " on " + spot.Monitor);
         }
 
         // Ctrl + scroll over the card: 10 % bigger or smaller a notch (120), around the corner it keeps to, in whole
@@ -1075,6 +1165,72 @@ namespace Kymo
             spot.Size = size;
             if (last != null) Draw();
             wheelSave.Stop(); wheelSave.Start();
+        }
+
+        // Shift + scroll over the card: its background 5 % more or less opaque a notch, from 40 to 100 % (the Settings
+        // page's steps), whatever the wheel's steps. Drawn at once; sent to the recorder a second after the last notch.
+        internal void OpacityWheel(int delta)
+        {
+            if (width == 0 || last == null) return;
+            if (Math.Sign(delta) != Math.Sign(opacityWheel)) opacityWheel = 0;
+            opacityWheel += delta;
+            int steps = opacityWheel / 120;
+            if (steps == 0) return;
+            opacityWheel -= steps * 120;
+            int from = pendingOpacity >= 0 ? pendingOpacity : look.Opacity;
+            int to = Math.Max(40, Math.Min(100, (int)Math.Round(from / 5.0) * 5 + 5 * steps));
+            if (to == from) return;
+            pendingOpacity = to; confirmedAfter = -1;
+            look.Opacity = last.Look.Opacity = to;
+            Draw();
+            opacitySend.Stop(); opacitySend.Start();
+        }
+
+        void SendOpacityNow()
+        {
+            opacitySend.Stop();
+            if (pendingOpacity < 0 || sendingOpacity) return;
+            var send = SendOpacity ?? (Test ? null : (Func<int, int>)(v => Source.Post("/api/settings", "card_opacity=" + v.ToString(CultureInfo.InvariantCulture))));
+            if (send == null) return;
+            int value = pendingOpacity;
+            sendingOpacity = true; resendOpacity = false;
+            Action<int> done = status =>
+            {
+                sendingOpacity = false;
+                if (status >= 200 && status < 300)
+                {
+                    // In: answers to fetches started from now on carry it, or a later change (the Settings page's).
+                    Log("opacity " + value + " %: in the recorder's settings");
+                    if (pendingOpacity == value) confirmedAfter = fetchSerial;
+                }
+                else if (status >= 400 && status < 500)
+                {
+                    // Refused (a recorder that does not know the setting, say): the card goes back to the recorder's.
+                    Log("opacity " + value + " % refused by the recorder (" + status + ")");
+                    if (pendingOpacity == value) pendingOpacity = -1;
+                }
+                else { Log("opacity " + value + " %: the recorder does not answer (" + status + "), sent again with its next answer"); resendOpacity = true; }
+                // Changed again while this one was on its way: that one goes too.
+                if (pendingOpacity >= 0 && pendingOpacity != value && !resendOpacity && !opacitySend.Enabled) opacitySend.Start();
+            };
+            if (Test) { done(send(value)); return; }
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                int status;
+                try { status = send(value); } catch (Exception e) { status = 0; Log("sending the opacity: " + e.Message); }
+                try { BeginInvoke((MethodInvoker)delegate { done(status); }); } catch { }
+            });
+        }
+
+        // An answer of the recorder's while an opacity set on the card is on its way: the card keeps it until the answers
+        // carry it (an answer can leave before the change is in), and sends it again if it did not get there.
+        void KeepPendingOpacity(Snapshot s)
+        {
+            if (pendingOpacity < 0) return;
+            bool settled = !sendingOpacity && !opacitySend.Enabled && !resendOpacity;
+            if (s.HasLook && settled && (s.Look.Opacity == pendingOpacity || (confirmedAfter >= 0 && s.Serial > confirmedAfter))) { pendingOpacity = -1; confirmedAfter = -1; return; }
+            s.Look.Opacity = pendingOpacity;
+            if (resendOpacity && s.Failure.Length == 0 && !sendingOpacity && !opacitySend.Enabled) SendOpacityNow();
         }
 
         // Where the mouse was when the message being handled was made (screen, physical px; signed for monitors
@@ -1125,6 +1281,9 @@ namespace Kymo
         internal double SizeShown { get { return SizeNow; } }
         internal void MouseMovedWithButtonUp() { Native.SendMessage(Handle, 0x0200, IntPtr.Zero, IntPtr.Zero); }
         internal void CtrlWheel(int delta) { Native.SendMessage(Handle, 0x020A, (IntPtr)((delta << 16) | 0x8), IntPtr.Zero); }
+        internal void ShiftWheel(int delta) { Native.SendMessage(Handle, 0x020A, (IntPtr)((delta << 16) | 0x4), IntPtr.Zero); }
+        internal int OpacityShown { get { return last != null ? last.Look.Opacity : look.Opacity; } }
+        internal void FlushOpacity() { if (opacitySend.Enabled) SendOpacityNow(); }
         internal void FlushWheel() { if (wheelSave.Enabled) { wheelSave.Stop(); SaveSpot("resized"); } }
 
         void Tick()
@@ -1171,12 +1330,14 @@ namespace Kymo
         {
             if (Test) return;
             fetching = true; lastFetch = Clock.Now; fetches++;
+            long serial = ++fetchSerial;
             if (Trace) Log("fetch");
             ThreadPool.QueueUserWorkItem(delegate
             {
                 Snapshot s;
                 try { s = source.Fetch(); }
                 catch (Exception e) { s = new Snapshot { Up = false }; s.Issues.Add(new Issue("crit", "Widget error: " + e.Message)); Log("fetch: " + e); }
+                s.Serial = serial;
                 try { BeginInvoke((MethodInvoker)delegate { fetching = false; Arrived(s); Draw(); }); } catch { }
             });
         }
@@ -1206,6 +1367,7 @@ namespace Kymo
                     catch (Exception e) { if (e.Message != lookError) Log("saving the card's settings: " + e.Message); lookError = e.Message; }
                 }
             }
+            KeepPendingOpacity(s);
             // The same sample again while the next one should be in: the recorder is late.
             bool same = last != null && s.SampleTs == last.SampleTs;   // NaN never equals
             late = same && Source.UnixNow() >= s.SampleTs + s.Interval + 1 ? late + 1 : 0;
@@ -1223,11 +1385,11 @@ namespace Kymo
             // Never bigger than the work area: a size chosen while it fitted is drawn smaller for as long as the card would
             // not fit (more issue lines, another look from the settings), and comes back after; the saved size stays.
             float k = K;
-            var full = Card.Measure(last.Look, Card.Shown(last).Count, k);
+            var full = Card.Measure(last.Look, Card.Shown(last).Count, k, Wider, Taller);
             if (full.Width > work.Width || full.Height > work.Height)
                 k *= (float)(Math.Min(work.Width / (double)full.Width, work.Height / (double)full.Height) * 0.998);
             drawnSize = 100 * k / scale;
-            using (var bmp = Card.Render(last, k))
+            using (var bmp = Card.Render(last, k, Wider, Taller))
             {
                 width = bmp.Width; height = bmp.Height;
                 // The size may have changed: still held at the same point, or by the same corner while resizing.
@@ -1384,10 +1546,15 @@ namespace Kymo
                         m.Result = (IntPtr)1; return;
                     }
                     break;
-                case 0x020A:   // WM_MOUSEWHEEL: with Ctrl held, bigger or smaller
+                case 0x020A:   // WM_MOUSEWHEEL: with Ctrl held, bigger or smaller; with Shift, more or less opaque
                     if ((m.WParam.ToInt64() & 0x8) != 0)   // MK_CONTROL
                     {
                         Wheel((short)((m.WParam.ToInt64() >> 16) & 0xFFFF));
+                        m.Result = IntPtr.Zero; return;
+                    }
+                    if ((m.WParam.ToInt64() & 0x4) != 0)   // MK_SHIFT
+                    {
+                        OpacityWheel((short)((m.WParam.ToInt64() >> 16) & 0xFFFF));
                         m.Result = IntPtr.Zero; return;
                     }
                     break;
@@ -1607,12 +1774,70 @@ namespace Kymo
 
             File.Delete(file);
             w.CheckSpotFile();
+            // An edge stretches the card that way only: its text keeps its size.
             Point edge = new Point(b.Left + 2, Mid(b).Y);
             w.Press(edge);
             for (int i = 1; i <= 10; i++) w.DragTo(new Point(edge.X - P(47) * i / 10, edge.Y + P(200) * i / 10));
             var wide = w.WindowRect;
-            Check(w.SizeShown == 110 && wide.Right == b.Right && wide.Top == b.Top, "pulled by its left edge: 110 % (up and down does not count), right edge and top stay (" + R(wide) + ")");
+            Check(w.SizeShown == 100 && wide.Right == b.Right && wide.Top == b.Top && wide.Height == b.Height && Math.Abs(wide.Width - (b.Width + P(47))) <= 1,
+                "pulled by its left edge: 47 px wider, no taller, still 100 % (up and down does not count); right edge and top stay (" + R(wide) + ")");
             w.Release();
+            s = Spot.Load(file);
+            Check(s.Size == 100 && s.Wider == 47 && s.Taller == 0 && s.X == 28 && s.Y == 28 && w.WindowRect == wide, "saved: 47 px wider, at 100 %, in the same place (" + s.Wider + ", " + s.Taller + ")");
+            edge = new Point(wide.Left + P(40), wide.Bottom - 3);
+            w.Press(edge);
+            for (int i = 1; i <= 10; i++) w.DragTo(new Point(edge.X + P(300) * i / 10, edge.Y + P(60) * i / 10));
+            var taller1 = w.WindowRect;
+            Check(w.SizeShown == 100 && taller1.Location == wide.Location && taller1.Width == wide.Width && Math.Abs(taller1.Height - (wide.Height + P(60))) <= 1,
+                "pulled by its bottom edge: 60 px taller, as wide, the top-left corner stays (" + R(taller1) + ")");
+            w.Release();
+            edge = new Point(Mid(taller1).X, taller1.Top + 2);
+            w.Press(edge);
+            for (int i = 1; i <= 10; i++) w.DragTo(new Point(edge.X, edge.Y - P(20) * i / 10));
+            var topPulled = w.WindowRect;
+            for (int i = 9; i >= 0; i--) w.DragTo(new Point(edge.X, edge.Y - P(20) * i / 10));
+            Check(topPulled.Bottom == taller1.Bottom && Math.Abs(topPulled.Height - (taller1.Height + P(20))) <= 1 && w.WindowRect == taller1,
+                "then by its top edge: 20 px taller still, the bottom stays; back where it began, as it was (" + R(topPulled) + ")");
+            w.Release();
+            edge = new Point(taller1.Left + 2, Mid(taller1).Y);
+            w.Press(edge);
+            for (int i = 1; i <= 10; i++) w.DragTo(new Point(edge.X + P(43) * i / 10, edge.Y));
+            Check(w.WindowRect.Width == b.Width && w.WindowRect.Right == b.Right, "pushed back within 8 px: as wide as made (" + R(w.WindowRect) + ")");
+            for (int i = 1; i <= 10; i++) w.DragTo(new Point(edge.X + P(300) * i / 10, edge.Y));
+            Check(w.WindowRect.Width == b.Width, "never narrower than made (" + R(w.WindowRect) + ")");
+            w.Release();
+            s = Spot.Load(file);
+            Check(s.Wider == 0 && s.Taller == 60, "saved: as wide as made, 60 px taller (" + s.Wider + ", " + s.Taller + ")");
+            // A corner still scales all of it, the room it was stretched by included.
+            var before = w.WindowRect;
+            corner = new Point(before.Left + 2, before.Bottom - 3);
+            w.Press(corner);
+            for (int i = 1; i <= 10; i++) w.DragTo(new Point(corner.X - before.Width / 5 * i / 10, corner.Y + before.Height / 5 * i / 10));
+            var scaled = w.WindowRect;
+            Check(w.SizeShown == 120 && scaled.Right == before.Right && scaled.Top == before.Top && Math.Abs(scaled.Height - before.Height * 1.2) <= 2 && Math.Abs(scaled.Width - before.Width * 1.2) <= 2,
+                "a corner scales the stretched card as a whole: 120 % (" + R(scaled) + ")");
+            w.Release();
+            // Stretched far: never beyond the work area, with room for all its issue lines.
+            File.Delete(file);
+            w.CheckSpotFile();
+            edge = new Point(b.Left + 2, Mid(b).Y);
+            w.Press(edge);
+            for (int i = 1; i <= 10; i++) w.DragTo(new Point(edge.X - P(6000) * i / 10, edge.Y));
+            var widest = w.WindowRect;
+            Check(widest.Left >= work.Left && widest.Left - work.Left <= P(2) && widest.Right == b.Right, "pulled far left: up to the work area's left end, its right edge where it was (" + R(widest) + ")");
+            w.Release();
+            edge = new Point(Mid(b).X, b.Bottom - 3);
+            w.Press(edge);
+            for (int i = 1; i <= 10; i++) w.DragTo(new Point(edge.X, edge.Y + P(6000) * i / 10));
+            w.Release();
+            w.ShowIssues(6);
+            var tallest = w.WindowRect;
+            w.ShowIssues(0);
+            Check(tallest.Top >= work.Top && tallest.Bottom <= work.Bottom && tallest.Height >= work.Height - P(2) && Math.Abs(tallest.Width - widest.Width) <= 1,
+                "pulled far down: with 6 issue lines it fills the work area's height, whole on the screen (" + R(tallest) + ")");
+            File.Delete(file);
+            w.CheckSpotFile();
+            Check(w.WindowRect == b, "no file: as made again (" + R(w.WindowRect) + ")");
 
             File.Delete(file);
             w.CheckSpotFile();
@@ -1679,6 +1904,51 @@ namespace Kymo
             w.Receive(new Snapshot { Up = true, HasLook = true, Look = new Look() });
             Check(!Look.Read(lookFile).Locked && w.Bounds2.Width == b.Width, "new settings replace them");
 
+            // ---- opacity: Shift + scroll, sent to the recorder's settings (here: kept in a list, never sent)
+            var sent = new List<int>();
+            int answer = 200;
+            WidgetWindow.SendOpacity = v => { sent.Add(v); return answer; };
+            w.Receive(new Snapshot { Up = true, HasLook = true, Look = new Look() });
+            w.ShiftWheel(120); w.ShiftWheel(120);
+            int up2 = w.OpacityShown;
+            for (int i = 0; i < 8; i++) w.ShiftWheel(15);
+            Check(up2 == 95 && w.OpacityShown == 100 && sent.Count == 0 && w.WindowRect == b, "Shift + scroll: 5 % a notch, small steps add up, up to 100 %; nothing sent yet, the card stays put (" + up2 + ", " + w.OpacityShown + ")");
+            w.FlushOpacity();
+            w.Receive(new Snapshot { Up = true, HasLook = true, Look = new Look { Opacity = 85 } });
+            int keptOpacity = w.OpacityShown;
+            w.Receive(new Snapshot { Up = true, HasLook = true, Look = new Look { Opacity = 100 } });
+            w.Receive(new Snapshot { Up = true, HasLook = true, Look = new Look { Opacity = 60 } });
+            Check(sent.Count == 1 && sent[0] == 100 && keptOpacity == 100 && w.OpacityShown == 60, "sent a second after: 100 %; an answer from before it keeps 100, then the Settings page's 60 % wins (" + string.Join(",", sent) + ")");
+            for (int i = 0; i < 6; i++) w.ShiftWheel(-120);
+            answer = 0;
+            w.FlushOpacity();
+            w.Receive(new Snapshot { Up = false, Failure = "unreachable" });
+            int whileDown = w.OpacityShown;
+            answer = 200;
+            w.Receive(new Snapshot { Up = true, HasLook = true, Look = new Look { Opacity = 60 } });
+            Check(whileDown == 40 && w.OpacityShown == 40 && sent.Count == 3 && sent[1] == 40 && sent[2] == 40, "never under 40 %; the recorder down: kept on the card and sent again with its next answer (" + string.Join(",", sent) + ")");
+            w.Receive(new Snapshot { Up = true, HasLook = true, Look = new Look { Opacity = 40 } });
+            w.ShiftWheel(120);
+            answer = 400;
+            w.FlushOpacity();
+            w.Receive(new Snapshot { Up = true, HasLook = true, Look = new Look { Opacity = 40 } });
+            Check(w.OpacityShown == 40, "refused by the recorder: back to the recorder's opacity");
+            sent.Clear();
+            answer = 200;
+            bool once = true;
+            WidgetWindow.SendOpacity = v => { sent.Add(v); if (once) { once = false; w.ShiftWheel(120); w.FlushOpacity(); } return answer; };
+            w.ShiftWheel(120);
+            w.FlushOpacity();
+            int afterFirst = sent.Count;
+            w.FlushOpacity();
+            Check(afterFirst == 1 && sent.Count == 2 && sent[1] == 50 && w.OpacityShown == 50, "a notch while the last value is on its way: sent after it (" + string.Join(",", sent) + ")");
+            w.Receive(new Snapshot { Up = true, HasLook = true, Look = new Look { Opacity = 45 }, Serial = 0 });
+            int beforeIt = w.OpacityShown;
+            w.Receive(new Snapshot { Up = true, HasLook = true, Look = new Look { Opacity = 70 }, Serial = 1 });
+            Check(beforeIt == 50 && w.OpacityShown == 70, "once in, an answer from before still shows it; a later answer's other value (the Settings page's) wins (" + beforeIt + ", " + w.OpacityShown + ")");
+            WidgetWindow.SendOpacity = null;
+            w.Receive(new Snapshot { Up = true, HasLook = true, Look = new Look() });
+
             // ---- locked in the settings
             File.Delete(file);
             w.CheckSpotFile();
@@ -1703,6 +1973,16 @@ namespace Kymo
             var four = new Look();
             four.Tiles[3] = four.Tiles[5] = false;
             Check(sizeOf(four) == new Size(470, 382), "4 tiles: 2 rows (" + sizeOf(four) + ")");
+            using (var bmp = Card.Render(new Snapshot { Up = true, Look = new Look() }, 1f, 100, 60))
+                Check(bmp.Size == new Size(570, 548) && Card.Measure(new Look(), 0, 1f, 100, 60) == bmp.Size, "stretched 100 px wider and 60 taller: 570 x 548, measured the same (" + bmp.Size + ")");
+            var roomy = new Spot { Wider = 120, Taller = 33 };
+            string spotFile = Path.Combine(Path.GetDirectoryName(file), "spot-check.txt");
+            roomy.Save(spotFile);
+            var back = Spot.Load(spotFile);
+            File.WriteAllLines(spotFile, new[] { "corner=top-right", "wider=-5" });
+            var bad = Spot.Load(spotFile);
+            File.Delete(spotFile);
+            Check(back.Wider == 120 && back.Taller == 33 && bad.Wider == 0 && bad.X == Spot.Margin, "the stretched room is saved and read back; a wrong one puts the card back as made");
             using (var bmp = Card.Render(new Snapshot { Up = true, Look = new Look { Opacity = 60 } }, 1f))
                 Check(Math.Abs(bmp.GetPixel(6, 300).A - 153) <= 2, "60 % opacity: the background lets the wallpaper through (alpha " + bmp.GetPixel(6, 300).A + ")");
             var mixed = new Snapshot { Up = true, Look = new Look { IssueLines = 1 } };
@@ -1733,8 +2013,11 @@ namespace Kymo
             {
                 var s = new Source().Fetch();
                 // Settings to try instead of the recorder's: key=value as in /api/card "card" (columns=3 charts=false).
-                if (args.Length > 2) s.Look = Look.From(Look.Pairs(args.Skip(2)));
-                using (var bmp = Card.Render(s, 1.5f)) bmp.Save(args[1], ImageFormat.Png);
+                var pairs = Look.Pairs(args.Skip(2));
+                if (args.Length > 2) s.Look = Look.From(pairs);
+                // wider= and taller=: stretched by its edges (logical px at 100 %).
+                Func<string, double> room = key => pairs.ContainsKey(key) && pairs[key] is int ? Math.Max(0, Math.Min(Spot.MaxRoom, (int)pairs[key])) : 0;
+                using (var bmp = Card.Render(s, 1.5f, room("wider"), room("taller"))) bmp.Save(args[1], ImageFormat.Png);
                 return 0;
             }
 

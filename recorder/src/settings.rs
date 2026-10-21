@@ -440,7 +440,7 @@ pub static FIELDS: &[Field] = &[
         key: "card_opacity",
         group: "Desktop card",
         label: "Background opacity",
-        help: "Below 100 % the wallpaper shows through the card's background (the text stays solid).",
+        help: "Below 100 % the wallpaper shows through the card's background (the text stays solid). Shift + scroll over the card changes it too.",
         kind: Kind::Range { min: 40, max: 100, step: 5, unit: "%" },
         default: || Value::Int(85),
     },
