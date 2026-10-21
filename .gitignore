@@ -1,0 +1,13 @@
+# Local only, never published:
+# the previous stack (its installers, downloads and tools) and its admin password,
+/old-stack/
+/grafana-admin-password.txt
+# history recorded by a local run, and the copy left by a migration,
+/recorder/data/
+/recorder/data.*/
+# builds and caches.
+/recorder/target/
+*.exe
+*.pdb
+__pycache__/
+*.log

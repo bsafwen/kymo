@@ -1,0 +1,103 @@
+# Releases: push a tag vX.Y.Z matching `version` in recorder/Cargo.toml. The whole CI runs first; then
+# the program it built and tested (bin\kymo.exe) goes into kymo-X.Y.Z-windows-x64.zip with the rest of
+# the repository, so installing a release needs no Rust. Run by hand (Actions > Release > Run workflow),
+# it is a dry run: the files are kept as an artifact of the run and nothing is published.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Package and publish
+    needs: checks
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the tags, for the changes since the previous release
+      - name: Version
+        id: version
+        run: |
+          $v = (Select-String -Path recorder/Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$v") {
+            throw "The tag $env:GITHUB_REF_NAME does not match the version in recorder/Cargo.toml ($v): tag v$v, or change the version first."
+          }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          "Kymo $v"
+      - name: The program CI built and tested
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: kymo-exe
+          path: ${{ runner.temp }}/exe
+      - name: Package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $name = "kymo-$env:VERSION-windows-x64"
+          $out = "$env:RUNNER_TEMP\out"
+          $stage = "$env:RUNNER_TEMP\stage\$name"
+          New-Item -ItemType Directory -Force $out, "$stage\bin" | Out-Null
+          # The repository as committed (no local files), plus the program.
+          git archive --format=zip -o "$env:RUNNER_TEMP\source.zip" HEAD
+          Expand-Archive "$env:RUNNER_TEMP\source.zip" $stage
+          Copy-Item "$env:RUNNER_TEMP\exe\kymo.exe" "$stage\bin\kymo.exe"
+          Compress-Archive -Path $stage -DestinationPath "$out\$name.zip"
+          Get-ChildItem $out -File | ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } |
+            Set-Content "$out\SHA256SUMS.txt" -Encoding ascii
+          Get-ChildItem $out | Format-Table Name, Length -AutoSize
+          Get-Content "$out\SHA256SUMS.txt"
+      - name: Release notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $previous = git describe --tags --abbrev=0 --match 'v*' HEAD^ 2>$null
+          $range = if ($LASTEXITCODE -eq 0 -and $previous) { "$previous..HEAD" } else { 'HEAD' }
+          $changes = git log --no-merges --format='- %s' $range
+          $notes = @(
+            '## Install (no Rust needed)'
+            ''
+            "1. Download ``kymo-$env:VERSION-windows-x64.zip`` below and extract it to a folder you keep, for example ``%LOCALAPPDATA%\Programs``: the desktop card and its sign-in tasks run from there, and ``uninstall.ps1`` is there."
+            "2. In [PowerShell 7](https://aka.ms/powershell), in the ``kymo-$env:VERSION-windows-x64`` folder (the one with ``install.ps1``), run as yourself (not elevated):"
+            ''
+            '   ```powershell'
+            '   Get-ChildItem -Recurse | Unblock-File'
+            '   pwsh -File .\install.ps1'
+            '   ```'
+            ''
+            'It asks once for administrator rights, installs or updates the service (the history is kept), then sets up the desktop card. `SHA256SUMS.txt` has the checksum of the zip.'
+            ''
+            "## Changes$(if ($range -ne 'HEAD') { " since $previous" })"
+            ''
+          ) + $changes
+          $notes | Set-Content "$env:RUNNER_TEMP\out\notes.md" -Encoding utf8
+          Get-Content "$env:RUNNER_TEMP\out\notes.md"
+      - name: Publish the release
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $out = "$env:RUNNER_TEMP\out"
+          gh release create $env:GITHUB_REF_NAME "$out\kymo-$env:VERSION-windows-x64.zip" "$out\SHA256SUMS.txt" `
+            --title "Kymo $env:VERSION" --notes-file "$out\notes.md" --verify-tag
+      - name: Dry run, keep the files
+        if: github.event_name != 'push'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-dry-run
+          path: ${{ runner.temp }}/out
+          retention-days: 7

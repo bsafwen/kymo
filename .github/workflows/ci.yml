@@ -1,0 +1,141 @@
+# Tests every push to main and every pull request; the release workflow runs it too, before it
+# packages anything (workflow_call). Windows only: the recorder and the card are Windows programs.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  recorder:
+    name: Recorder (Rust ${{ matrix.rust }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1.81: the oldest supported (rust-version in Cargo.toml), formatting and lints are checked
+        # with it; stable: the newest, to see new compiler releases early.
+        rust: ['1.81', stable]
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: recorder
+    env:
+      # Every cargo and rustc call uses exactly this toolchain (never the runner's default).
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust ${{ matrix.rust }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          rustup toolchain install ${{ matrix.rust }} --profile minimal --component rustfmt,clippy --no-self-update
+          rustc --version
+          cargo --version
+      - name: Formatting (cargo fmt)
+        if: matrix.rust == '1.81'
+        run: cargo fmt --check
+      - name: Lints (clippy, warnings are errors)
+        if: matrix.rust == '1.81'
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --locked
+      - name: Release build
+        run: cargo build --release --locked
+      - name: Runs without the Visual C++ Redistributable (C runtime linked in, .cargo/config.toml)
+        run: |
+          if (Select-String -LiteralPath target/release/kymo.exe -Pattern 'VCRUNTIME140' -SimpleMatch -Quiet) {
+            throw 'kymo.exe needs VCRUNTIME140.dll, which a clean Windows does not have'
+          }
+      - name: Keep the program
+        if: matrix.rust == '1.81'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: kymo-exe
+          path: recorder/target/release/kymo.exe
+          if-no-files-found: error
+          retention-days: 14
+
+  card:
+    name: Desktop card
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Screen of 1920 x 1080 (the self-test needs 1000 x 900 logical px)
+        run: |
+          $size = 'Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Size'
+          "before: $(pwsh -NoProfile -Command $size)"
+          if (Get-Command Set-DisplayResolution -ErrorAction SilentlyContinue) {
+            try { Set-DisplayResolution -Width 1920 -Height 1080 -Force -ErrorAction Stop } catch { "Set-DisplayResolution: $_" }
+          } else { 'Set-DisplayResolution is not available here' }
+          "after: $(pwsh -NoProfile -Command $size)"
+      - name: Build (the C# compiler that ships with Windows)
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\card" | Out-Null
+          .\desktop\card\build.ps1 -Out "$env:RUNNER_TEMP\card\KymoCard.exe"
+      - name: Self-test (moving, resizing, settings, drawing)
+        run: |
+          $dir = "$env:RUNNER_TEMP\card-test"
+          $p = Start-Process "$env:RUNNER_TEMP\card\KymoCard.exe" -ArgumentList '--selftest', "`"$dir`"" -PassThru
+          if (-not $p.WaitForExit(180000)) { $p.Kill(); throw 'the self-test did not finish in 3 minutes' }
+          Get-Content "$dir\card.log"
+          if ($p.ExitCode -ne 0) { throw "$($p.ExitCode) check(s) failed" }
+      - name: A card drawn without the recorder
+        run: |
+          $p = Start-Process "$env:RUNNER_TEMP\card\KymoCard.exe" -ArgumentList '--snapshot', "`"$env:RUNNER_TEMP\card\snapshot.png`"", 'columns=3' -PassThru
+          if (-not $p.WaitForExit(60000)) { $p.Kill(); throw 'the snapshot did not finish in a minute' }
+          if ($p.ExitCode -ne 0 -or -not (Test-Path "$env:RUNNER_TEMP\card\snapshot.png")) { throw "no snapshot (exit $($p.ExitCode))" }
+      - name: Keep the log and the snapshot
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: card-check
+          path: |
+            ${{ runner.temp }}/card-test/card.log
+            ${{ runner.temp }}/card/snapshot.png
+          if-no-files-found: ignore
+          retention-days: 14
+
+  scripts:
+    name: Scripts and dashboards
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: PowerShell scripts parse (PowerShell 7)
+        shell: pwsh
+        run: |
+          $bad = 0
+          foreach ($f in git ls-files '*.ps1') {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f).Path, [ref]$tokens, [ref]$errors) | Out-Null
+            foreach ($e in $errors) { "::error file=$f,line=$($e.Extent.StartLineNumber)::$($e.Message)"; $bad++ }
+          }
+          if ($bad) { exit 1 }
+      - name: Scripts that run in Windows PowerShell 5.1 parse there too
+        shell: powershell
+        run: |
+          $bad = 0
+          foreach ($f in git ls-files '*.ps1') {
+            if ((Get-Content $f -TotalCount 3) -match '#Requires -Version 7') { continue }
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f).Path, [ref]$tokens, [ref]$errors) | Out-Null
+            foreach ($e in $errors) { "::error file=$f,line=$($e.Extent.StartLineNumber)::$($e.Message)"; $bad++ }
+          }
+          if ($bad) { exit 1 }
+      - name: Dashboards script (node --check)
+        run: node --check recorder/ui/app.js
+      - name: VictoriaMetrics import script (python)
+        run: python -m py_compile recorder/import_vm.py

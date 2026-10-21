@@ -1,0 +1,5 @@
+# The C runtime linked into the programs (+crt-static), so they run on a Windows without the Visual C++
+# Redistributable (a release's bin\kymo.exe on a clean PC). Cargo reads this file when it runs from this
+# folder or below (CI runs in recorder\, install.ps1 runs cargo from recorder\).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

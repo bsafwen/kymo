@@ -1,0 +1,17 @@
+[package]
+name = "kymo"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+description = "Performance history of this PC in one process: collector, storage and HTTP API"
+license = "Unlicense"
+publish = false
+
+# No dependencies: Windows functions are declared by hand (src/win.rs), the HTTP server, JSON and the
+# file format are small enough to write here. Nothing is downloaded to build it.
+[dependencies]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
