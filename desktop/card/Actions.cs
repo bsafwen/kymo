@@ -506,9 +506,9 @@ namespace Kymo
                     var tree = ProcActions.Tree(new[] { shell }, r.All);
                     Check(tree[0] == shell && tree.Contains(child) && tree.Skip(1).All(p => p.Parent == shell.Pid) && tree.Count <= 3,
                         "its tree: the process first, then those it started (" + string.Join(", ", tree.Select(p => p.Image)) + ")");
-                    Check(shell.BasePriority == 8, "its priority read as the list reads it: normal (" + shell.BasePriority + ")");
 
                     // Each priority offered: set, read back as the list reads it (the base its menu entry is dotted by); then normal.
+                    // (It starts at its parent's: below normal on a build machine.)
                     var bases = new List<int>();
                     for (int i = 0; i < ProcActions.Priorities.Length; i++)
                     {
@@ -548,8 +548,9 @@ namespace Kymo
 
                     // The menu's entries: for this process (normal priority, a child), and for a program of three with
                     // two priorities and no file to open.
-                    var row = new ProcRow { Key = "pid:test", Name = "Windows Command Processor", First = shell };
-                    row.Procs.Add(shell);
+                    var now = again ?? shell;   // at normal priority now
+                    var row = new ProcRow { Key = "pid:test", Name = "Windows Command Processor", First = now };
+                    row.Procs.Add(now);
                     var items = ProcMenu.For(row, tree, false);
                     var prio = items.First(i => i.Sub != null).Sub;
                     var commands = items.Where(i => i.Text != null && !i.Grayed).Select(i => i.Id).ToList();
