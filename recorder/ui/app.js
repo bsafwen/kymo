@@ -745,6 +745,9 @@ class Tile {
   }
 }
 
+// The process that holds other apps' memory, compressed (not an app of its own).
+const COMPRESSION = 'Memory Compression';
+
 /** A sortable, filterable table of apps. */
 class AppTable {
   constructor(parent, title, desc, span, cfg) {
@@ -775,7 +778,13 @@ class AppTable {
     // Shaded on a fixed scale, as the Grafana table: 0 % green to 25 % or more red.
     const body = rows.slice(0, 500).map(r => el('tr', { class: this.cfg.picked && this.cfg.picked.has(r.name) ? 'picked' : null },
       ...cols.map(c => {
-        if (c.key === 'name') return el('td', { class: 'link', text: r.name, title: 'Open in Process explorer', onclick: () => this.cfg.onName(r.name) });
+        if (c.key === 'name') {
+          if (r.name !== COMPRESSION) return el('td', { class: 'link', text: r.name, title: 'Open in Process explorer', onclick: () => this.cfg.onName(r.name) });
+          // Not an app's own memory: other apps' pages, compressed when RAM runs short.
+          const note = el('span', { text: ' (other apps\u2019 memory, compressed)' });
+          note.style.opacity = '0.6';
+          return el('td', { class: 'link', title: 'Windows keeps other apps\u2019 memory here, compressed, when RAM runs short. Open in Process explorer', onclick: () => this.cfg.onName(r.name) }, r.name, note);
+        }
         const td = el('td', { text: format(r[c.key], c.unit) });
         if (c.heat && r[c.key] != null) {
           td.style.background = heatColor(r[c.key] / 25);
@@ -1246,7 +1255,8 @@ function pageApps() {
       const apps = await appList(r);
       if (!alive()) return;
       c.table.set(apps);
-      const top = (k, n = 10) => [...apps].sort((a, b) => (b[k] || 0) - (a[k] || 0)).slice(0, n).map(a => a.name);
+      // Memory Compression holds other apps' memory, compressed: not an app of its own in the memory and commit charts.
+      const top = (k, n = 10) => [...apps].filter(a => k === 'cpu_avg' || a.name !== COMPRESSION).sort((a, b) => (b[k] || 0) - (a[k] || 0)).slice(0, n).map(a => a.name);
       const io = [...apps].sort((a, b) => (b.read_bytes + b.write_bytes) - (a.read_bytes + a.write_bytes)).slice(0, 10).map(a => a.name);
       const [cpu, mem, rd, wr, com, marks] = await Promise.all([
         appSeries(top('cpu_avg'), 'cpu', r, step, true),

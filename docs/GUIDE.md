@@ -23,7 +23,7 @@ It was written to replace a stack of four services (windows_exporter, nvidia_gpu
 - **Live status card**, top right at first:
   - a green **ALL GOOD** bar, or orange or red **N ISSUES** with one line per problem and the app most responsible;
   - six tiles, each with the last 30 seconds and the last hour: CPU, memory, commit, GPU, disk C: and network;
-  - the top apps by CPU and memory, and whether recording is OK.
+  - the top apps by CPU and memory, and whether recording is OK. *Memory Compression* is never the top app by memory: it holds other apps' memory, compressed when RAM runs short (Task Manager leaves it out of its Processes tab too).
   - It updates with each new sample (every 10 s by default), or every 30 s after 5 minutes without input. It pauses while it is covered, the PC is locked or the screen is off.
   - **Show desktop** (Win+D) brings it to the front.
   - Click it to open the dashboards. Right-click it to open its settings (below, under Desktop card).
@@ -37,8 +37,8 @@ It was written to replace a stack of four services (windows_exporter, nvidia_gpu
 - **Process list**, next to the card at first: every process of this PC, as Task Manager's Processes tab shows them.
   - Columns: name (with the program's icon), PID, CPU, memory, I/O and GPU; threads, handles and commit can be added. Over each column, the PC's total: CPU and memory in %, I/O in MB/s, GPU in %. Cells are shaded the more a process uses: CPU against a quarter of the PC, memory and commit against a tenth of the RAM, I/O against 50 MB/s, GPU against half of it.
     - **CPU:** its share of all the CPU, as Task Manager counts it.
-    - **Memory:** its private working set, the memory only it uses that is in RAM now (Task Manager's Memory column).
-    - **I/O:** what it reads and writes per second, files, devices and the network together. Windows tells a program run as the user what each process reads and writes, but not which part of it goes to the disk: this is not Task Manager's Disk column.
+    - **Memory:** its private working set, the memory only it uses that is in RAM now (Task Manager's Memory column). *Memory Compression* is not in the list, as in Task Manager's Processes tab: it holds other apps' memory, compressed. Its size shows in the list's title instead ("6.0 GB compressed"), when the list is wide enough (a narrow list keeps the time first).
+    - **I/O:** what it reads and writes per second, files, devices and the network together, in MB/s (GB/s from 1000 MB/s). Windows tells a program run as the user what each process reads and writes, but not which part of it goes to the disk: this is not Task Manager's Disk column.
     - **GPU:** its busiest GPU engine (3D, video, copy and so on), from the same counters as Task Manager.
     - Network and power use per process are not shown: Windows gives them only to programs running as administrator.
   - **One row per app:** the processes of one program make one row, with their count, added up. Click it to see each process under it, with its PID; click it again to fold it. Services that do not let a user read their program show under the name of their file in System32 (for example *Host Process for Windows Services*).
@@ -75,6 +75,7 @@ It was written to replace a stack of four services (windows_exporter, nvidia_gpu
   **The app behind an issue**, at the end of its line ("top: ..."), where one app can be named:
   - CPU busy: the busiest app over the same 5 minutes. Memory in use: the app using the most (private working set). Commit: the app with the most private bytes.
   - Heavy paging: the app with the most hard page faults over 5 minutes, with its share of the PC's page reads ("top: X 60 %"). A hard fault is one read from the disk, the page file or a mapped file, of one page or a few, so it is compared with the PC's page reads, not with the pages/s figure. An app is named only when it makes at least a fifth of the reads: reads through the file cache (a big file copy, a scan) are charged to no app by Windows, and the line then names none rather than a wrong one. The recorder counts faults per app in memory only, so it names one from about a minute after it starts.
+  - Never *Memory Compression*, for memory, commit or paging: what it holds is other apps' memory, compressed, and its hard faults read that memory back from the page file. The next app is named instead, if one qualifies.
   - Disk busy or slow: the app reading and writing the most over 5 minutes ("top I/O"), from 1 MB/s. Windows counts an app's I/O for files (cached reads included), devices and the network together, and none for paging, so it points at the likely app rather than proving it was this disk.
   - GPU hot, or its memory full: the app busiest on the GPU (a fifth of it at least), or with the most GPU memory (256 MB at least), from the counters Task Manager uses, on the GPU the temperature and memory are about (the one with the most dedicated memory in use; an integrated GPU's apps are left out). The card reads GPU use while the GPU is warm or busy and for 5 minutes after, so the app is known when the issue shows; GPU memory while it is full.
   - The others (a disk almost full, the CPU held back by power or heat, a GPU slowdown, network errors) have no one app behind them, and name none.
@@ -85,7 +86,7 @@ It was written to replace a stack of four services (windows_exporter, nvidia_gpu
 ## The dashboards
 http://127.0.0.1:21223 has four pages.
 - **This PC:** the right-now tiles, then CPU (overall, per logical processor, clocks, power and limit), memory, disks, network, GPU, and the recorder's own coverage and cost.
-- **Apps:** the busiest apps by CPU, memory, I/O and commit, and a table of every app in the range.
+- **Apps:** the busiest apps by CPU, memory, I/O and commit, and a table of every app in the range. *Memory Compression* is left out of the memory and commit charts (it holds other apps' memory, compressed); the table still lists it, marked as such.
 - **Process explorer:** pick apps to see their CPU, memory, commit, I/O and instances over time.
 - **Settings:** see below.
 

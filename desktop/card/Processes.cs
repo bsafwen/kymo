@@ -12,7 +12,6 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
-using System.Drawing.Text;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -66,6 +65,7 @@ namespace Kymo
         public double Cpu, Memory;        // % of all the CPU, % of the RAM in use
         public double Io;                 // bytes per second, all processes
         public double Gpu = double.NaN;   // % of the busiest GPU engine
+        public double Compressed;         // bytes of RAM holding other processes' memory, compressed (Memory Compression)
         public DateTime At = DateTime.Now;
     }
 
@@ -316,7 +316,10 @@ namespace Kymo
                     if (gpuByPid != null) { double g; x.Gpu = gpuByPid.TryGetValue(pid, out g) ? g : 0; }
                     if (x.Image.Length == 0) x.Image = pid == 4 ? "System" : "Process " + pid.ToString(CultureInfo.InvariantCulture);
                     r.Io += x.Io;
-                    r.All.Add(x);
+                    // Memory Compression holds other processes' pages, compressed: no process of its own (Task Manager's
+                    // Processes tab leaves it out too). Its size is shown as compressed memory.
+                    if (x.Image == "Memory Compression") r.Compressed = x.Memory;
+                    else r.All.Add(x);
                 }
                 if (next == 0) break;
                 off += next;
@@ -460,7 +463,10 @@ namespace Kymo
         // The scroll bar's column, right of the rows and clear of the edge the list is resized by: its thumb 6 px wide,
         // 10 px under the mouse or held, at least 32 px tall.
         public const float ScrollW = 14, ThumbW = 6, ThumbWide = 10, ThumbMinH = 32;
-        static readonly float[] Widths = { 0, 64, 64, 100, 100, 58, 66, 74, 100 };   // per Col (Name: NameW + stretch)
+        // Per Col (Name: NameW + stretch): each fits its widest text at every scale the list can be drawn at (ProcSelfTest
+        // checks it), GDI rounding the fonts up the most at small ones.
+        static readonly float[] Widths = { 0, 67, 70, 100, 107, 70, 80, 90, 100 };
+        const float SmallPx = 12, TotalPx = 17, RowPx = 13;   // font sizes: titles and notes, the PC's totals, rows
         static readonly string[] Titles = { "Name", "PID", "CPU", "Memory", "I/O", "GPU", "Threads", "Handles", "Commit" };
         static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
         static readonly Color Text = Color.FromArgb(236, 239, 243), Dim = Color.FromArgb(160, 168, 180), Back = Color.FromArgb(215, 16, 19, 25);
@@ -561,8 +567,9 @@ namespace Kymo
                 case Col.Pid: return r.Count > 1 ? "" : r.First.Pid.ToString(Inv);
                 case Col.Cpu: return r.Cpu < 0.05 ? "0%" : r.Cpu.ToString(r.Cpu >= 99.95 ? "0" : "0.0", Inv) + "%";
                 case Col.Memory: return Mb(r.Memory);
-                case Col.Io: return r.Io < 0.05 * 1048576 ? "0 MB/s" : (r.Io / 1048576).ToString("#,0.0", Inv) + " MB/s";
-                case Col.Gpu: return double.IsNaN(r.Gpu) ? "-" : r.Gpu < 0.05 ? "0%" : r.Gpu.ToString("0.0", Inv) + "%";
+                case Col.Io: return r.Io < 0.05 * 1048576 ? "0 MB/s" : r.Io >= 999.95 * 1048576 ? (r.Io / 1073741824).ToString("#,0.0", Inv) + " GB/s"
+                    : (r.Io / 1048576).ToString("0.0", Inv) + " MB/s";
+                case Col.Gpu: return double.IsNaN(r.Gpu) ? "-" : r.Gpu < 0.05 ? "0%" : r.Gpu.ToString(r.Gpu >= 99.95 ? "0" : "0.0", Inv) + "%";
                 case Col.Threads: return r.Threads.ToString("#,0", Inv);
                 case Col.Handles: return r.Handles.ToString("#,0", Inv);
                 case Col.Commit: return Mb(r.Commit);
@@ -593,7 +600,8 @@ namespace Kymo
             {
                 case Col.Cpu: return r.Cpu.ToString("0", Inv) + "%";
                 case Col.Memory: return r.Memory.ToString("0", Inv) + "%";
-                case Col.Io: return (r.Io / 1048576).ToString(r.Io >= 100 * 1048576 ? "#,0" : "0.0", Inv) + " MB/s";
+                case Col.Io: return r.Io >= 999.5 * 1048576 ? (r.Io / 1073741824).ToString("#,0.0", Inv) + " GB/s"
+                    : (r.Io / 1048576).ToString(r.Io >= 99.95 * 1048576 ? "0" : "0.0", Inv) + " MB/s";
                 case Col.Gpu: return double.IsNaN(r.Gpu) ? "" : r.Gpu.ToString("0", Inv) + "%";
                 case Col.Threads: return r.All.Sum(p => (long)p.Threads).ToString("#,0", Inv);
                 case Col.Handles: return r.All.Sum(p => (long)p.Handles).ToString("#,0", Inv);
@@ -619,6 +627,34 @@ namespace Kymo
             return new RectangleF(track.X + (track.Width - width) / 2, y, width, h);
         }
 
+        // The texts that would be cut at scale k, laid out as Render lays them out: the widest a cell and the PC's total
+        // can realistically be in each column (with values just under a change of format), and its title beside the sort
+        // arrow (for --selftest).
+        internal static List<string> Unfit(float k)
+        {
+            var bad = new List<string>();
+            var rows = new[] { 99.9, 100 }.SelectMany(pct => new[] { 999.9, 999.97, 99999.9 }.Select(io => new ProcRow { First = new Proc { Pid = 999999 },
+                Cpu = pct, Gpu = pct, Memory = 99999.9 * 1048576, Commit = 99999.9 * 1048576, Io = io * 1048576, Threads = 9999, Handles = 999999 })).ToList();
+            var totals = new[] { 99.9, 99.97, 999.4, 999.7, 99999.0 }.Select(io =>
+            {
+                var t = new ProcReading { Cpu = 100, Memory = 100, Gpu = 100, Io = io * 1048576 };
+                t.All.Add(new Proc { Threads = 99999, Handles = 999999, Commit = 999.9 * 1073741824 });
+                return t;
+            }).ToList();
+            using (var fSmall = new Font("Segoe UI", k * SmallPx, GraphicsUnit.Pixel))
+            using (var fTotal = new Font("Segoe UI", k * TotalPx, GraphicsUnit.Pixel))
+            using (var fRow = new Font("Segoe UI", k * RowPx, GraphicsUnit.Pixel))
+                foreach (Col c in Enum.GetValues(typeof(Col)))
+                {
+                    if (c == Col.Name) continue;
+                    float cw = k * Width(c, 0);
+                    foreach (string s in rows.Select(r => Cell(c, r)).Distinct()) if (Ink.Width(s, fRow) > cw - k * 10) bad.Add(Titles[(int)c] + " \"" + s + "\"");
+                    foreach (string s in totals.Select(t => Total(c, t)).Distinct()) if (Ink.Width(s, fTotal) > cw - k * 12) bad.Add(Titles[(int)c] + " total \"" + s + "\"");
+                    if (Ink.Width(Titles[(int)c], fSmall) > cw - k * 20) bad.Add(Titles[(int)c] + " title beside the sort arrow");
+                }
+            return bad;
+        }
+
         // `scroll`: the scroll bar as drawn: 0 at rest, 1 under the mouse, 2 held.
         public static Bitmap Render(ProcReading r, List<ProcRow> rows, List<Col> cols, Col sort, bool ascending, ICollection<string> open, int first,
             float k, double wider, double taller, int opacity, double ram, Hits hits, int scroll = 0)
@@ -634,17 +670,14 @@ namespace Kymo
             var bmp = new Bitmap(w, h, PixelFormat.Format32bppPArgb);
             using (var g = Graphics.FromImage(bmp))
             using (var fTitle = new Font("Segoe UI", S(17), FontStyle.Bold, GraphicsUnit.Pixel))
-            using (var fSmall = new Font("Segoe UI", S(12), GraphicsUnit.Pixel))
-            using (var fTotal = new Font("Segoe UI", S(17), GraphicsUnit.Pixel))
-            using (var fRow = new Font("Segoe UI", S(13), GraphicsUnit.Pixel))
-            using (var text = new SolidBrush(Text))
-            using (var dim = new SolidBrush(Dim))
+            using (var fSmall = new Font("Segoe UI", S(SmallPx), GraphicsUnit.Pixel))
+            using (var fTotal = new Font("Segoe UI", S(TotalPx), GraphicsUnit.Pixel))
+            using (var fRow = new Font("Segoe UI", S(RowPx), GraphicsUnit.Pixel))
             using (var rule = new Pen(Rule, 1))
             using (var right = new StringFormat { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap })
             using (var left = new StringFormat { LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap })
             {
                 g.SmoothingMode = SmoothingMode.AntiAlias; g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
                 g.InterpolationMode = InterpolationMode.HighQualityBicubic;
                 g.Clear(Color.Transparent);
                 var back = Color.FromArgb((int)Math.Round(255 * Math.Max(40, Math.Min(100, opacity)) / 100.0), Back);
@@ -653,10 +686,21 @@ namespace Kymo
 
                 float x0 = S(Pad), y = S(Pad);
                 // The title, and how many processes and when.
-                g.DrawString("Processes", fTitle, text, new RectangleF(x0, y, w / 2f, S(TitleH)), left);
+                Ink.Draw(g, bmp, "Processes", fTitle, Text, new RectangleF(x0, y, w / 2f, S(TitleH)), left);
                 if (r != null)
-                    g.DrawString(r.All.Count.ToString("#,0", Inv) + " processes  \u00b7  updated " + r.At.ToString("HH:mm:ss", Inv), fSmall, dim,
-                        new RectangleF(w / 2f, y, w / 2f - S(Pad), S(TitleH)), right);
+                {
+                    // How many, the memory held compressed and when, beside the title: the longest of these that fits,
+                    // without the compressed memory first, then without the count, so that the time stays whole.
+                    float from = x0 + Ink.Width("Processes", fTitle) + S(12), room = w - S(Pad) - from;
+                    string count = r.All.Count.ToString("#,0", Inv) + " processes", time = r.At.ToString("HH:mm:ss", Inv), when = "updated " + time;
+                    string held = r.Compressed >= 1073741824 ? (r.Compressed / 1073741824).ToString("0.0", Inv) + " GB compressed"
+                        : r.Compressed >= 1048576 ? Math.Round(r.Compressed / 1048576).ToString("0", Inv) + " MB compressed" : "";
+                    var lines = new List<string>();
+                    if (held.Length > 0) lines.Add(count + "  \u00b7  " + held + "  \u00b7  " + when);
+                    lines.Add(count + "  \u00b7  " + when); lines.Add(when); lines.Add(time);
+                    string line = lines.FirstOrDefault(l => Ink.Width(l, fSmall) <= room) ?? time;
+                    Ink.Draw(g, bmp, line, fSmall, Dim, new RectangleF(from, y, room, S(TitleH)), right);
+                }
                 y += S(TitleH);
 
                 // Column titles: the PC's total over each, the sorted one shaded with an arrow.
@@ -670,9 +714,9 @@ namespace Kymo
                     bool num = c != Col.Name;
                     var top = new RectangleF(x + S(6), y + S(2), cw - S(12), S(HeadH / 2));
                     var bottom = new RectangleF(x + S(6), y + S(HeadH / 2), cw - S(12), S(HeadH / 2 - 4));
-                    if (num) g.DrawString(Total(c, r), fTotal, text, top, right);
-                    g.DrawString(Titles[(int)c], fSmall, dim, bottom, num ? right : left);
-                    if (c == sort) Arrow(g, dim.Color, num ? x + S(10) : x + cw - S(14), y + S(HeadH) - S(12), S(4), ascending);
+                    if (num) Ink.Draw(g, bmp, Total(c, r), fTotal, Text, top, right);
+                    Ink.Draw(g, bmp, Titles[(int)c], fSmall, Dim, bottom, num ? right : left);
+                    if (c == sort) Arrow(g, Dim, num ? x + S(10) : x + cw - S(14), y + S(HeadH) - S(12), S(4), ascending);
                     x += cw;
                 }
                 y += S(HeadH);
@@ -696,12 +740,12 @@ namespace Kymo
                             // The arrow of a program with more than one process, then the icons in one column (a process
                             // under its program a step further in).
                             float ix = x + S(row.Child ? 40 : 18);
-                            if (row.Count > 1) Chevron(g, dim.Color, x + S(4), y + S(RowH / 2), S(4), open.Contains(row.Key));
+                            if (row.Count > 1) Chevron(g, Dim, x + S(4), y + S(RowH / 2), S(4), open.Contains(row.Key));
                             g.DrawImage(AppInfo.Icon(row.First), ix, y + (S(RowH) - S(16)) / 2, S(16), S(16));
                             string name = row.Name + (row.Count > 1 ? " (" + row.Count.ToString(Inv) + ")" : "");
-                            g.DrawString(name, fRow, text, new RectangleF(ix + S(22), y, x + cw - ix - S(26), S(RowH)), left);
+                            Ink.Draw(g, bmp, name, fRow, Text, new RectangleF(ix + S(22), y, x + cw - ix - S(26), S(RowH)), left);
                         }
-                        else g.DrawString(Cell(c, row), fRow, text, new RectangleF(x + S(4), y, cw - S(10), S(RowH)), right);
+                        else Ink.Draw(g, bmp, Cell(c, row), fRow, Text, new RectangleF(x + S(4), y, cw - S(10), S(RowH)), right);
                         x += cw;
                     }
                     y += S(RowH);
@@ -1060,8 +1104,8 @@ namespace Kymo
             var mine = r == null ? null : r.All.FirstOrDefault(x => x.Pid == me);
             Check(mine != null && mine.Memory > 0 && mine.Threads > 0 && mine.Cpu > 0.3 && mine.Path != null && mine.Path.EndsWith(".exe", StringComparison.OrdinalIgnoreCase),
                 "this process read: memory, threads, its program, CPU while busy (" + (mine == null ? "missing" : mine.Cpu.ToString("0.0", CultureInfo.InvariantCulture) + " %") + ")");
-            Check(r != null && r.Cpu >= 0 && r.Cpu <= 100 && r.Memory > 0 && r.Memory < 100 && r.All.Count > 20 && !r.All.Any(x => x.Pid == 0),
-                "the PC's CPU and memory in %, every process but the idle one (" + (r == null ? 0 : r.All.Count) + " processes)");
+            Check(r != null && r.Cpu >= 0 && r.Cpu <= 100 && r.Memory > 0 && r.Memory < 100 && r.All.Count > 20 && !r.All.Any(x => x.Pid == 0) && !r.All.Any(x => x.Image == "Memory Compression") && r.Compressed >= 0,
+                "the PC's CPU and memory in %, every process but the idle one and Memory Compression (" + (r == null ? 0 : r.All.Count) + " processes, " + (r == null ? 0 : Math.Round(r.Compressed / 1048576)) + " MB compressed)");
             // Read as it runs: the first reading only primes the rates (nothing drawn yet); the next, a second later, is
             // shown; one right after it (within half a second) is not taken.
             var fresh = new ProcessWindow(card);
@@ -1072,6 +1116,11 @@ namespace Kymo
             bool shown = fresh.HasReading;
             fresh.Dispose();
             Check(none && shown, "read as it runs: the first reading primes, the next one is shown (" + none + ", " + shown + ")");
+
+            // Every column shows its widest text whole at every scale the list can be drawn at: the monitor's scaling
+            // times the list's own size, 60 to 400 % in steps of 1 % (GDI rounds the fonts up, the most at small ones).
+            var cut = Enumerable.Range(60, 341).SelectMany(pct => ProcTable.Unfit(pct / 100f).Select(s => s + " at " + pct + " %")).ToList();
+            Check(cut.Count == 0, "every column shows its widest text whole at every scale from 60 to 400 %" + (cut.Count > 0 ? ": cut: " + string.Join(", ", cut.Take(6)) : ""));
 
             int gpid; string engine;
             Check(GpuEngines.Parse("pid_1234_luid_0x00000000_0x0000D1F2_phys_0_eng_3_engtype_VideoDecode", out gpid, out engine) && gpid == 1234 && engine == "0x00000000_0x0000D1F2|0|VideoDecode"
@@ -1185,7 +1234,7 @@ namespace Kymo
             int before = w.Bounds2.Width;
             w.Apply(l);
             hits = w.LastHits;
-            Check(hits.Total == 45 && Math.Abs(w.Bounds2.Width - before - P(66)) <= 2, "one row per process (45), and a threads column (" + (w.Bounds2.Width - before) + " px wider)");
+            Check(hits.Total == 45 && Math.Abs(w.Bounds2.Width - before - P(ProcTable.Width(Col.Threads, 0))) <= 2, "one row per process (45), and a threads column (" + (w.Bounds2.Width - before) + " px wider)");
             w.ClickAt(Mid(hits.Titles.First(t => t.Value == Col.Threads).Key, w.Bounds2.Location));
             bool byThreads = w.SortedBy == Col.Threads;
             w.Apply(new Look());

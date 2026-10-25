@@ -78,6 +78,8 @@ const AVG_MS: i64 = 300_000;
 const KEEP_MS: i64 = 3_600_000;
 /// Apps: the top CPU is averaged over the last five ended minutes.
 const APPS_MS: i64 = 300_000;
+/// The process holding other apps' memory, compressed: never the top app by memory, commit or paging.
+const COMPRESSION: &str = "Memory Compression";
 /// A minute of apps ends with the first sample after it: older than this, the apps are not current.
 fn apps_fresh_ms() -> i64 {
     (70_000 + 2 * crate::interval_ms()).max(130_000)
@@ -556,8 +558,11 @@ impl Recent {
     /// per second over the minutes that counted them, which those read back from the history did not,
     /// with "share": its % of the PC's page reads). An app is named for paging only when it makes at
     /// least a fifth of the page reads and one a second: reads through the file cache are charged to
-    /// no app, and naming whichever app faulted a little would name the wrong one. Left out when the
-    /// newest minute of apps is not current.
+    /// no app, and naming whichever app faulted a little would name the wrong one. Memory Compression
+    /// is never named for memory, commit or paging: its working set holds other apps' pages, compressed
+    /// when RAM runs short, and its hard faults read those pages back from the page file (Task
+    /// Manager's Processes tab leaves it out too). Left out when the newest minute of apps is not
+    /// current.
     fn write_top(&self, o: &mut String, t_ref: i64) {
         key(o, "top", false);
         o.push('{');
@@ -592,7 +597,7 @@ impl Recent {
                     if v[3].is_finite() && v[4].is_finite() {
                         *io.entry(name.as_str()).or_default() += (v[3] + v[4]) * secs;
                     }
-                    if f.is_finite() {
+                    if f.is_finite() && name != COMPRESSION {
                         *faults.entry(name.as_str()).or_default() += f * secs;
                     }
                 }
@@ -619,7 +624,7 @@ impl Recent {
                 .map(|(name, f)| (name, f, (100.0 * f / page_reads).min(100.0)));
             let biggest = |field: usize| {
                 rows.iter()
-                    .filter(|(_, v, _)| v[field].is_finite())
+                    .filter(|(name, v, _)| v[field].is_finite() && name != COMPRESSION)
                     .max_by(|a, b| {
                         a.1[field]
                             .total_cmp(&b.1[field])
@@ -936,6 +941,7 @@ mod tests {
         let t0 = 1_792_454_400_000;
         // Five minutes: "disk" reads 8 MB/s and writes 2; "pager" faults 300 times a second in
         // four of them (the fifth: none), "quiet" does neither. The PC: `reads` page reads a second.
+        // Memory Compression faults the most, reading other apps' pages back: never named.
         let five = |reads: f64| {
             let mut r = Recent::new("C:".into());
             sample_at(&mut r, t0, 1.0, 0.0, 0.0);
@@ -950,9 +956,14 @@ mod tests {
                     v: [1.0, 1.0, 0.0, 1e3, 0.0, 1.0, 1.0, 1.0, 60.0],
                     faults: if m < 4 { 300.0 } else { 0.0 },
                 };
+                let store = AppRow {
+                    name: "Memory Compression".into(),
+                    v: [1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 60.0],
+                    faults: 500.0,
+                };
                 r.apps(
                     t0 + (m + 1) * 60_000,
-                    &[io, pager, row("quiet", 0.0, 1.0, 1.0)],
+                    &[io, pager, store, row("quiet", 0.0, 1.0, 1.0)],
                 );
             }
             r.sample(t0 + 5 * 60_000, &[s("mem.page_reads", reads)]);
@@ -1032,7 +1043,11 @@ mod tests {
             let a = if m == 0 { 100.0 } else { 0.0 };
             r.apps(
                 t0 + (m + 1) * 60_000,
-                &[row("a", a, 9e9, 1.0), row("b", 60.0, 1.0, 5e9)],
+                &[
+                    row("a", a, 9e9, 1.0),
+                    row("b", 60.0, 1.0, 5e9),
+                    row("Memory Compression", 1.0, 20e9, 6e9),
+                ],
             );
         }
         let end = t0 + 6 * 60_000;

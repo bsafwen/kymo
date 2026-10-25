@@ -29,7 +29,6 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
-using System.Drawing.Text;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -67,6 +66,11 @@ namespace Kymo
         [DllImport("gdi32.dll")] public static extern bool DeleteDC(IntPtr dc);
         [DllImport("gdi32.dll")] public static extern IntPtr SelectObject(IntPtr dc, IntPtr o);
         [DllImport("gdi32.dll")] public static extern bool DeleteObject(IntPtr o);
+        [StructLayout(LayoutKind.Sequential)]
+        public struct BITMAPINFOHEADER { public int Size, Width, Height; public short Planes, BitCount; public int Compression, SizeImage, XPelsPerMeter, YPelsPerMeter, ClrUsed, ClrImportant; }
+        [DllImport("gdi32.dll")] public static extern IntPtr CreateDIBSection(IntPtr dc, ref BITMAPINFOHEADER bi, uint usage, out IntPtr bits, IntPtr section, uint offset);
+        [DllImport("gdi32.dll")] public static extern bool PatBlt(IntPtr dc, int x, int y, int w, int h, uint rop);
+        [DllImport("gdi32.dll")] public static extern bool GdiFlush();
         [DllImport("gdi32.dll")] public static extern IntPtr CreateRectRgn(int l, int t, int r, int b);
         [DllImport("gdi32.dll")] public static extern int CombineRgn(IntPtr dst, IntPtr a, IntPtr b, int mode);
         [DllImport("user32.dll")] public static extern IntPtr GetTopWindow(IntPtr h);
@@ -637,6 +641,119 @@ namespace Kymo
         static string TopIo(string app) { return app.Length > 0 ? " · top I/O: " + app : ""; }
     }
 
+    // Text as Windows draws it, with the user's ClearType settings. GDI+ draws thin, grey text on a layered window, and
+    // GDI cannot draw on one (it leaves the alpha at 0, and ClearType needs an opaque background). So GDI draws the text
+    // white on black in a scratch bitmap, where each colour channel tells how much of that subpixel the text covers;
+    // that coverage is blended into the layer in the text's colour, and a pixel's alpha comes from its most covered
+    // subpixel. One alpha for three subpixels lets less of the wallpaper through the less covered ones, which tints it
+    // where the background is see-through: so the coverage keeps its colour only as far as that tint stays within a
+    // tenth of the wallpaper's light (all of it from 90 % opacity, two thirds at 85 %, mostly grey at 40 %).
+    // The layer's Graphics is flushed first, so the text lands over what was drawn before it.
+    static class Ink
+    {
+        [ThreadStatic] static Scratch scratch;
+
+        // A memory DC holding a top-down 32-bit DIB for GDI to draw into, kept for the next text and grown as needed:
+        // a Bitmap and its Graphics for each text cost four times the whole drawing of the process list.
+        sealed class Scratch : IDeviceContext
+        {
+            public IntPtr Dc, Bits; public int W, H;
+            IntPtr dib;
+            public void Fit(int w, int h)
+            {
+                if (dib != IntPtr.Zero && w <= W && h <= H) return;
+                if (Dc == IntPtr.Zero) Dc = Native.CreateCompatibleDC(IntPtr.Zero);
+                if (Dc == IntPtr.Zero) throw new InvalidOperationException("no GDI memory DC for text");
+                int nw = Math.Max(w, W), nh = Math.Max(h, H);
+                var bi = new Native.BITMAPINFOHEADER { Size = 40, Width = nw, Height = -nh, Planes = 1, BitCount = 32 };
+                IntPtr bits, next = Native.CreateDIBSection(Dc, ref bi, 0, out bits, IntPtr.Zero, 0);
+                if (next == IntPtr.Zero) throw new InvalidOperationException("no GDI bitmap for text");
+                Native.SelectObject(Dc, next);
+                if (dib != IntPtr.Zero) Native.DeleteObject(dib);   // the DC's first bitmap is a stock one: never deleted
+                dib = next; Bits = bits; W = nw; H = nh;
+            }
+            public IntPtr GetHdc() { return Dc; }
+            public void ReleaseHdc() { }
+            public void Dispose() { }
+        }
+
+        // One line of text in `r`, laid out by `fmt`: its alignment, line alignment and ellipsis (null: top left).
+        public static void Draw(Graphics g, Bitmap layer, string s, Font f, Color c, RectangleF r, StringFormat fmt)
+        {
+            if (string.IsNullOrEmpty(s) || c.A == 0) return;
+            var box = Rectangle.Intersect(Rectangle.FromLTRB((int)Math.Floor(r.Left), (int)Math.Floor(r.Top), (int)Math.Ceiling(r.Right), (int)Math.Ceiling(r.Bottom)),
+                new Rectangle(0, 0, layer.Width, layer.Height));
+            if (box.Width <= 0 || box.Height <= 0) return;
+            g.Flush(FlushIntention.Sync);
+            var m = scratch ?? (scratch = new Scratch());
+            m.Fit(box.Width, box.Height);
+            Native.PatBlt(m.Dc, 0, 0, box.Width, box.Height, 0x00000042);   // BLACKNESS
+            var at = new Rectangle((int)Math.Round(r.X) - box.X, (int)Math.Round(r.Y) - box.Y, (int)Math.Round(r.Width), (int)Math.Round(r.Height));
+            TextRenderer.DrawText(m, s, f, at, Color.White, Flags(fmt));
+            Native.GdiFlush();
+            Blend(m, layer, box, c);
+        }
+
+        // One line of text with its top left at (x, y).
+        public static void Draw(Graphics g, Bitmap layer, string s, Font f, Color c, float x, float y)
+        {
+            if (string.IsNullOrEmpty(s)) return;
+            var size = TextRenderer.MeasureText(s, f, Size.Empty, Flags(null));
+            Draw(g, layer, s, f, c, new RectangleF(x, y, size.Width, size.Height), null);
+        }
+
+        // Its width as Draw lays it out, in pixels.
+        public static int Width(string s, Font f) { return TextRenderer.MeasureText(s, f, Size.Empty, Flags(null)).Width; }
+
+        static TextFormatFlags Flags(StringFormat fmt)
+        {
+            var fl = TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix;
+            if (fmt == null) return fl;
+            if (fmt.Alignment == StringAlignment.Center) fl |= TextFormatFlags.HorizontalCenter;
+            else if (fmt.Alignment == StringAlignment.Far) fl |= TextFormatFlags.Right;
+            if (fmt.LineAlignment == StringAlignment.Center) fl |= TextFormatFlags.VerticalCenter;
+            else if (fmt.LineAlignment == StringAlignment.Far) fl |= TextFormatFlags.Bottom;
+            if (fmt.Trimming == StringTrimming.EllipsisCharacter) fl |= TextFormatFlags.EndEllipsis;
+            return fl;
+        }
+
+        // The coverage at the top left of `m` (white on black) into `layer` at `box`, in colour `c` (premultiplied ARGB).
+        static void Blend(Scratch m, Bitmap layer, Rectangle box, Color c)
+        {
+            var ld = layer.LockBits(box, ImageLockMode.ReadWrite, PixelFormat.Format32bppPArgb);
+            try
+            {
+                int n = box.Width; var cover = new int[n]; var px = new int[n];
+                int ca = c.A, cr = c.R, cg = c.G, cb = c.B;   // read once: each read of a named colour looks it up
+                for (int y = 0; y < box.Height; y++)
+                {
+                    Marshal.Copy(m.Bits + y * m.W * 4, cover, 0, n);
+                    bool any = false;
+                    for (int x = 0; x < n && !any; x++) any = (cover[x] & 0xFFFFFF) != 0;
+                    if (!any) continue;
+                    Marshal.Copy(ld.Scan0 + y * ld.Stride, px, 0, n);
+                    for (int x = 0; x < n; x++)
+                    {
+                        int v = cover[x];
+                        int er = ((v >> 16) & 255) * ca / 255, eg = ((v >> 8) & 255) * ca / 255, eb = (v & 255) * ca / 255;
+                        if ((er | eg | eb) == 0) continue;
+                        int d = px[x];
+                        int da = (d >> 24) & 255, dr = (d >> 16) & 255, dg = (d >> 8) & 255, db = d & 255;
+                        // The tint is the colour kept times how see-through the background is: at most 0.1 (25.5 of 255).
+                        int keep = Math.Min(256, 6528 / Math.Max(1, 255 - da)), grey = (er + eg + eb) / 3;
+                        er = grey + (er - grey) * keep / 256; eg = grey + (eg - grey) * keep / 256; eb = grey + (eb - grey) * keep / 256;
+                        int em = Math.Max(er, Math.Max(eg, eb));
+                        int oa = (255 * em + da * (255 - em)) / 255;
+                        int or = (cr * er + dr * (255 - er)) / 255, og = (cg * eg + dg * (255 - eg)) / 255, ob = (cb * eb + db * (255 - eb)) / 255;
+                        px[x] = (oa << 24) | (Math.Min(or, oa) << 16) | (Math.Min(og, oa) << 8) | Math.Min(ob, oa);
+                    }
+                    Marshal.Copy(px, 0, ld.Scan0 + y * ld.Stride, n);
+                }
+            }
+            finally { layer.UnlockBits(ld); }
+        }
+    }
+
     // Draws the card into a premultiplied 32-bit bitmap (transparent around it).
     static class Card
     {
@@ -707,14 +824,11 @@ namespace Kymo
             using (var fValue = new Font("Segoe UI", S(24), FontStyle.Bold, GraphicsUnit.Pixel))
             using (var fSub = new Font("Segoe UI", S(12), GraphicsUnit.Pixel))
             using (var fFoot = new Font("Segoe UI", S(11.5f), GraphicsUnit.Pixel))
-            using (var text = new SolidBrush(Text))
-            using (var dim = new SolidBrush(Dim))
             using (var right = new StringFormat { Alignment = StringAlignment.Far })
             using (var center = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
             using (var ellipsis = new StringFormat { Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap })
             {
                 g.SmoothingMode = SmoothingMode.AntiAlias; g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
                 g.Clear(Color.Transparent);
 
                 var back = Color.FromArgb((int)Math.Round(255 * Math.Max(40, Math.Min(100, look.Opacity)) / 100.0), Back);
@@ -722,21 +836,21 @@ namespace Kymo
                 using (var b = new SolidBrush(back)) using (var pen = new Pen(Edge, 1)) { g.FillPath(b, card); g.DrawPath(pen, card); }
 
                 float y = pad;
-                g.DrawString("This PC", fTitle, text, pad, y);
-                if (look.Clock) g.DrawString(DateTime.Now.ToString("HH:mm", Inv), fClock, dim, new RectangleF(pad, y + S(5), w - 2 * pad, S(24)), right);
+                Ink.Draw(g, bmp, "This PC", fTitle, Text, pad, y);
+                if (look.Clock) Ink.Draw(g, bmp, DateTime.Now.ToString("HH:mm", Inv), fClock, Dim, new RectangleF(pad, y + S(5), w - 2 * pad, S(24)), right);
                 y += S(40);
 
                 string worst = "ok";
                 foreach (var i in s.Issues) { if (i.Level == "crit") worst = "crit"; else if (i.Level == "warn" && worst != "crit") worst = "warn"; }
                 string label = !s.Up ? "MONITORING PROBLEM" : s.Issues.Count == 0 ? "ALL GOOD" : s.Issues.Count == 1 ? "1 ISSUE" : s.Issues.Count + " ISSUES";
                 using (var bar = Round(pad, y, w - 2 * pad, S(36), S(10))) using (var b = new SolidBrush(Of(worst))) g.FillPath(b, bar);
-                g.DrawString(label, fBar, Brushes.White, new RectangleF(pad, y, w - 2 * pad, S(36)), center);
+                Ink.Draw(g, bmp, label, fBar, Color.White, new RectangleF(pad, y, w - 2 * pad, S(36)), center);
                 y += S(44);
 
                 foreach (var i in issues)
                 {
                     using (var b = new SolidBrush(Of(i.Level))) g.FillEllipse(b, pad + S(2), y + S(7), S(9), S(9));
-                    g.DrawString(i.Text, fIssue, text, new RectangleF(pad + S(18), y, w - 2 * pad - S(18), S(22)), ellipsis);
+                    Ink.Draw(g, bmp, i.Text, fIssue, Text, new RectangleF(pad + S(18), y, w - 2 * pad - S(18), S(22)), ellipsis);
                     y += S(24);
                 }
                 if (rows > 0) y += S(6);
@@ -760,9 +874,9 @@ namespace Kymo
                         var t = tiles[shown[j]];
                         float x = pad + (j % cols) * (tileW + gap), ty = y + (j / cols) * (tileH + gap);
                         using (var tp = Round(x, ty, tileW, tileH, S(10))) g.FillPath(tileBrush, tp);
-                        g.DrawString(t.Item1, fLabel, dim, x + S(10), ty + S(7));
-                        using (var vb = new SolidBrush(Of(t.Item4))) g.DrawString(t.Item2, fValue, vb, x + S(8), ty + S(22));
-                        g.DrawString(t.Item3, fSub, dim, new RectangleF(x + S(6), ty + S(9), tileW - S(16), S(18)), right);
+                        Ink.Draw(g, bmp, t.Item1, fLabel, Dim, x + S(10), ty + S(7));
+                        Ink.Draw(g, bmp, t.Item2, fValue, Of(t.Item4), x + S(8), ty + S(22));
+                        Ink.Draw(g, bmp, t.Item3, fSub, Dim, new RectangleF(x + S(6), ty + S(9), tileW - S(16), S(18)), right);
                         double[] pts;
                         if (look.Charts && s.Series.TryGetValue(t.Item5, out pts) && pts.Length >= 4) Spark(g, pts, t.Item6, Of(t.Item4), x + S(8), ty + tileH - S(8), tileW - S(16), S(30) + stretch, S(1.6f));
                     }
@@ -776,8 +890,8 @@ namespace Kymo
                     if (s.TopMem.Length > 0) top.Add("Top memory: " + s.TopMem);
                     // One tile wide, the line has no room for both: one each.
                     if (cols == 1)
-                        for (int i = 0; i < 2; i++) { if (i < top.Count) g.DrawString(top[i], fLabel, text, new RectangleF(pad, y, w - 2 * pad, S(20)), ellipsis); y += S(20); }
-                    else { g.DrawString(string.Join("  \u00b7  ", top), fLabel, text, new RectangleF(pad, y, w - 2 * pad, S(20)), ellipsis); y += S(20); }
+                        for (int i = 0; i < 2; i++) { if (i < top.Count) Ink.Draw(g, bmp, top[i], fLabel, Text, new RectangleF(pad, y, w - 2 * pad, S(20)), ellipsis); y += S(20); }
+                    else { Ink.Draw(g, bmp, string.Join("  \u00b7  ", top), fLabel, Text, new RectangleF(pad, y, w - 2 * pad, S(20)), ellipsis); y += S(20); }
                 }
                 if (look.Status)
                 {
@@ -788,8 +902,8 @@ namespace Kymo
                         : !double.IsNaN(s.LastSampleTs) ? "last sample " + Source.Local(s.LastSampleTs).ToString("HH:mm:ss", Inv) : "no sample yet";
                     string foot = state + "  \u00b7  " + when;
                     // The hint only where it fits whole (one tile wide, or a long state): never cut in half.
-                    if (g.MeasureString(foot + "  \u00b7  " + Hint, fFoot, new SizeF(100000, S(18)), ellipsis).Width <= w - 2 * pad) foot += "  \u00b7  " + Hint;
-                    g.DrawString(foot, fFoot, dim, new RectangleF(pad, y, w - 2 * pad, S(18)), ellipsis);
+                    if (Ink.Width(foot + "  \u00b7  " + Hint, fFoot) <= w - 2 * pad) foot += "  \u00b7  " + Hint;
+                    Ink.Draw(g, bmp, foot, fFoot, Dim, new RectangleF(pad, y, w - 2 * pad, S(18)), ellipsis);
                 }
             }
             return bmp;
@@ -2222,11 +2336,10 @@ namespace Kymo
             longest.V["paging5"] = 15000; longest.V["disk5"] = 100; longest.V["readLat5"] = 999; longest.V["gpuTemp"] = 105; longest.V["vram"] = 100; longest.V["cpu5"] = 100; longest.V["mem"] = 100;
             Source.AddIssues(longest, 99.9 * 1073741824.0, longName);
             float room = 470 - 2 * 18 - 18, widestPx = 0; string widestText = "";
-            using (var bmp = new Bitmap(10, 10)) using (var g = Graphics.FromImage(bmp)) using (var f = new Font("Segoe UI", 14, GraphicsUnit.Pixel))
-            using (var fmt = new StringFormat { FormatFlags = StringFormatFlags.NoWrap })
+            using (var f = new Font("Segoe UI", 14, GraphicsUnit.Pixel))
                 foreach (var i in longest.Issues.Where(x => x.Text.Contains(" top")))
                 {
-                    float wpx = g.MeasureString(i.Text, f, new SizeF(100000, 30), fmt).Width;
+                    float wpx = Ink.Width(i.Text, f);
                     if (wpx > widestPx) { widestPx = wpx; widestText = i.Text; }
                 }
             Check(widestPx <= room, "every issue line with an app fits the card: the widest " + Math.Round(widestPx) + " px of " + room + " (" + widestText + ")");
