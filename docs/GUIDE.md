@@ -34,6 +34,19 @@ It was written to replace a stack of four services (windows_exporter, nvidia_gpu
   - **Its transparency:** hold Shift and scroll over it: its background gets 5 % more or less opaque a notch, from 40 to 100 % (the text stays solid). It is the card's *Background opacity* setting, so the Settings page shows the change and the card keeps it after a restart. If the recorder does not answer, the card keeps it and sends it again once the recorder is back.
   - Its place, size and stretch are kept in `%LOCALAPPDATA%\Kymo\card-placement.txt`. Delete that file to put the card back top right at its usual size.
   - **What it shows** (tiles, tiles per row, charts, issue lines, the lines below the tiles, the clock, opacity) is set on the Settings page, under Desktop card; the card follows with its next sample (every 10 s by default). There you can also lock its place and size. The card keeps its last settings (`card-look.txt`, next to its place), so it starts as you set it up even before the recorder answers.
+- **Process list**, next to the card at first: every process of this PC, as Task Manager's Processes tab shows them.
+  - Columns: name (with the program's icon), PID, CPU, memory, I/O and GPU; threads, handles and commit can be added. Over each column, the PC's total: CPU and memory in %, I/O in MB/s, GPU in %. Cells are shaded the more a process uses: CPU against a quarter of the PC, memory and commit against a tenth of the RAM, I/O against 50 MB/s, GPU against half of it.
+    - **CPU:** its share of all the CPU, as Task Manager counts it.
+    - **Memory:** its private working set, the memory only it uses that is in RAM now (Task Manager's Memory column).
+    - **I/O:** what it reads and writes per second, files, devices and the network together. Windows tells a program run as the user what each process reads and writes, but not which part of it goes to the disk: this is not Task Manager's Disk column.
+    - **GPU:** its busiest GPU engine (3D, video, copy and so on), from the same counters as Task Manager.
+    - Network and power use per process are not shown: Windows gives them only to programs running as administrator.
+  - **One row per app:** the processes of one program make one row, with their count, added up. Click it to see each process under it, with its PID; click it again to fold it. Services that do not let a user read their program show under the name of their file in System32 (for example *Host Process for Windows Services*).
+  - **Sort:** click a column title; again for the other way. It is sorted by memory at first, the biggest first.
+  - **More rows:** scroll over it; pull its bottom edge to show more at once.
+  - It is read again every 2 s by default, and only while it can be seen, like the card. It costs about a millisecond each time.
+  - **Move, stretch, scale and transparency** as the card: drag it to move it; an edge stretches it (a wider name column, more rows), a corner or Ctrl + scroll scales all of it; Shift + scroll sets its opacity (its own, 85 % at first). Its place, size, opacity and sort are kept in `%LOCALAPPDATA%\Kymo\processes-placement.txt`; delete it to put the list back next to the card.
+  - **What it shows** (shown or not, its columns, one row per app, how often it is read, the lock of its place and size) is set on the Settings page, under Process list. Right-click it to go there.
 - **What counts as an issue** (the defaults; change them on the Settings page, under Alerts; the dashboards' tiles use the same):
 
   | Check | Orange | Red |
@@ -85,6 +98,7 @@ http://127.0.0.1:21223/#/settings. Every field offers only valid values, each sh
 | Retention | how long each tier is kept; a ceiling for the whole history (when it is reached the oldest files go first: samples, then apps per minute, minutes, apps per hour, hours) | samples 90 days, 1-minute summaries 2 years, hourly 10 years, apps per minute 6 months, apps per hour 10 years; 10 GB |
 | Alerts | the orange and red thresholds of the card and the tiles (table above) | as above |
 | Desktop card | each of the six tiles on or off; the disk it shows; 1, 2 or 3 tiles per row; the last-hour charts; how many issue lines (0 to 6, red ones first); the top apps line, the status line and the clock; background opacity (40 to 100 %); lock its place and size | all tiles; the system drive; 2 per row; charts on; 6 lines; all lines and the clock on; 85 %; unlocked |
+| Process list | shown on the desktop or not; the PID, CPU, memory, I/O, GPU, threads, handles and commit columns; one row per app; read every 1, 2 or 5 s; its place and size locked | shown; PID, CPU, memory, I/O and GPU; one row per app; every 2 s; not locked |
 | Display | how often the dashboards refresh | automatic |
 
 - **Saving** applies at once, without a restart: a new interval from the next sample, a shorter retention right away. Before you save, the page says which files a shorter retention deletes and estimates how big the history will grow.
@@ -112,10 +126,12 @@ http://127.0.0.1:21223/#/settings. Every field offers only valid values, each sh
 
 | Path | What |
 |---|---|
-| This repository | `install.ps1`, `uninstall.ps1`, `verify.ps1`, `test-resilience.ps1`, `desktop\` (the card and its installer), `recorder\` (the program's source and README) |
+| This repository | `install.ps1`, `uninstall.ps1`, `verify.ps1`, `test-resilience.ps1`, `desktop\` (the card, the process list and their installer), `recorder\` (the program's source and README) |
 | `C:\Program Files\Kymo\kymo.exe` | The installed program (only administrators can change it) |
 | `C:\ProgramData\Kymo\history\` | The history and the recorder's log (written by the service only; readable by you) |
-| `%LOCALAPPDATA%\Kymo\card.log` | The desktop card's log |
+| `%LOCALAPPDATA%\Kymo\card.log` | The log of the desktop card and the process list |
+| `%LOCALAPPDATA%\Kymo\card-placement.txt`, `processes-placement.txt` | Where the card and the process list sit, their size (and the list's opacity and sort) |
+| `%LOCALAPPDATA%\Kymo\card-look.txt` | The card's and the list's last settings, for a start before the recorder answers |
 
 ## Security
 - Everything listens on 127.0.0.1 only, and no firewall rule is added.

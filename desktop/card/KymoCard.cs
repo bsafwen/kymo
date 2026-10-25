@@ -8,15 +8,18 @@
 // dashboards, right-click it for its settings (what it shows: the recorder's Settings page, see Look). Drag
 // it to move it; drag an edge to make it wider or taller (its text keeps its size), a corner or Ctrl + scroll
 // over it to make all of it bigger or smaller (its place and size: %LOCALAPPDATA%\Kymo\card-placement.txt,
-// see Spot). Shift + scroll over it sets its background opacity (a setting of the recorder's, sent there). Built with the C# compiler that ships with Windows
-// (C# 5, .NET Framework 4.8): see build.ps1.
+// see Spot). Shift + scroll over it sets its background opacity (a setting of the recorder's, sent there).
+// The process list (Processes.cs) is a second widget of this program, beside the card. Built with the C#
+// compiler that ships with Windows (C# 5, .NET Framework 4.8): see build.ps1.
 // Log: %LOCALAPPDATA%\Kymo\card.log
 //
 // KymoCard.exe                      run (one instance per user session)
 // KymoCard.exe --snapshot out.png [key=value ...]   render one card to a PNG and exit (for checks), with
 //                                   settings to try (as in /api/card "card": columns=3 charts=false;
 //                                   wider=120 taller=60 for a card stretched by its edges)
-// KymoCard.exe --selftest <folder>  check moving the card with a second card (exit code: failed checks)
+// KymoCard.exe --snapshot-processes out.png [wider=N taller=N]   render the process list (Processes.cs) to a PNG
+// KymoCard.exe --selftest <folder>  check moving the card with a second card, and the process list (exit code:
+//                                   failed checks)
 // KymoCard.exe --trace              also log every fetch and every pause/resume
 // KymoCard.exe --trace --always-visible   fetch and draw even while covered (to check the timing)
 
@@ -182,6 +185,7 @@ namespace Kymo
         public readonly bool[] Tiles = { true, true, true, true, true, true };
         public int Columns = 2, IssueLines = 6, Opacity = 85;
         public bool Charts = true, TopApps = true, Status = true, Clock = true, Locked;
+        public ProcLook Procs = new ProcLook();   // the process list's (/api/card "processes"; procs_ in card-look.txt)
 
         static string B(bool v) { return v ? "true" : "false"; }
 
@@ -192,6 +196,7 @@ namespace Kymo
             for (int i = 0; i < TileKeys.Length; i++) sb.Append(TileKeys[i] + "=" + B(Tiles[i]) + "\r\n");
             sb.Append("columns=" + Columns + "\r\nissue_lines=" + IssueLines + "\r\nopacity=" + Opacity + "\r\ncharts=" + B(Charts) + "\r\ntop_apps=" + B(TopApps) +
                 "\r\nstatus=" + B(Status) + "\r\nclock=" + B(Clock) + "\r\nlocked=" + B(Locked) + "\r\n");
+            sb.Append(Procs.ToText("procs_"));
             return sb.ToString();
         }
 
@@ -232,6 +237,7 @@ namespace Kymo
             l.Opacity = num("opacity", 85, 40, 100);
             l.Charts = flag("charts", true); l.TopApps = flag("top_apps", true); l.Status = flag("status", true);
             l.Clock = flag("clock", true); l.Locked = flag("locked", false);
+            l.Procs = ProcLook.From(m, "procs_");
             return l;
         }
     }
@@ -389,6 +395,8 @@ namespace Kymo
                     foreach (var k in DefaultLimits.Keys) { double v = Num(limits, k); if (!double.IsNaN(v)) s.Limits[k] = v; }
                 var look = Map(root, "card");
                 if (look != null) { s.Look = Look.From(look); s.HasLook = true; }
+                var procs = Map(root, "processes");
+                if (procs != null && s.HasLook) s.Look.Procs = ProcLook.From(procs, "");
 
                 // Starting: no sample yet. Resuming: after start-up or sleep, the next sample brings the figures back.
                 s.Status = Text(root, "status");
@@ -726,6 +734,11 @@ namespace Kymo
         public double X = Margin, Y = Margin;
         public double Size = 100;
         public double Wider, Taller;
+        // The process list's own: its opacity (40 to 100 %; -1: its default) and the column it is sorted by. The card's
+        // opacity is a setting of the recorder's.
+        public int Opacity = -1;
+        public string Sort = "";
+        public bool Ascending;
 
         public string Corner { get { return (Bottom ? "bottom" : "top") + "-" + (Right ? "right" : "left"); } }
 
@@ -733,13 +746,14 @@ namespace Kymo
 
         // The spot in the file, the default if there is none or it does not make sense, or null if it could not be
         // read just now (being written, say): then try again later.
-        public static Spot Load(string file)
+        public static Spot Load(string file) { return Load(file, () => new Spot()); }
+        public static Spot Load(string file, Func<Spot> fallback)
         {
             var s = new Spot();
             string[] lines;
             try
             {
-                if (!File.Exists(file)) return s;
+                if (!File.Exists(file)) return fallback();
                 lines = File.ReadAllLines(file);
                 readError = "";
             }
@@ -756,7 +770,7 @@ namespace Kymo
                     int eq = line.IndexOf('=');
                     if (line.StartsWith("#") || eq < 0) continue;
                     string key = line.Substring(0, eq).Trim(), value = line.Substring(eq + 1).Trim();
-                    double v;
+                    double v; int n;
                     if (key == "monitor") s.Monitor = value;
                     else if (key == "corner")
                     {
@@ -773,6 +787,9 @@ namespace Kymo
                         if (!double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out v) || !(v >= MinSize && v <= MaxSize)) throw new FormatException("size " + value);
                         s.Size = Math.Round(v);
                     }
+                    else if (key == "opacity" && int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out n) && n >= 40 && n <= 100) s.Opacity = n;
+                    else if (key == "sort" && value.Length > 0 && value.Length <= 20 && value.All(char.IsLetter)) s.Sort = value;
+                    else if (key == "order") s.Ascending = value == "ascending";
                     else if (key == "wider" || key == "taller")
                     {
                         if (!double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out v) || !(v >= 0 && v <= MaxRoom)) throw new FormatException(key + " " + value);
@@ -781,7 +798,7 @@ namespace Kymo
                 }
                 return s;
             }
-            catch (Exception e) { WidgetWindow.Log("card position ignored (" + e.Message + "): back to the default"); return new Spot(); }
+            catch (Exception e) { WidgetWindow.Log(Path.GetFileName(file) + " ignored (" + e.Message + "): back to the default"); return fallback(); }
         }
 
         public void Save(string file)
@@ -793,7 +810,9 @@ namespace Kymo
                 "monitor=" + Monitor + "\r\ncorner=" + Corner + "\r\n" +
                 "x=" + X.ToString("0.#", CultureInfo.InvariantCulture) + "\r\ny=" + Y.ToString("0.#", CultureInfo.InvariantCulture) + "\r\n" +
                 "size=" + Size.ToString("0", CultureInfo.InvariantCulture) + "\r\n" +
-                "wider=" + Wider.ToString("0", CultureInfo.InvariantCulture) + "\r\ntaller=" + Taller.ToString("0", CultureInfo.InvariantCulture) + "\r\n";
+                "wider=" + Wider.ToString("0", CultureInfo.InvariantCulture) + "\r\ntaller=" + Taller.ToString("0", CultureInfo.InvariantCulture) + "\r\n" +
+                (Opacity >= 40 ? "opacity=" + Opacity.ToString(CultureInfo.InvariantCulture) + "\r\n" : "") +
+                (Sort.Length > 0 ? "sort=" + Sort + "\r\norder=" + (Ascending ? "ascending" : "descending") + "\r\n" : "");
             Write(file, text);
         }
 
@@ -807,34 +826,29 @@ namespace Kymo
         }
     }
 
-    sealed class WidgetWindow : Form
+    // A widget drawn on the desktop (the card, the process list): a window with per-pixel transparency
+    // (UpdateLayeredWindow) kept just above the desktop, below every other window, that pauses while it cannot be
+    // seen. Dragged to move it; an edge stretches it that way, a corner or Ctrl + scroll scales all of it (its place
+    // and size: a Spot in its own file). What it draws, and what a click does, is the widget's own.
+    abstract class DeskWindow : Form
     {
-        public static string PositionFile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Kymo\card-placement.txt");
-        public static string LookFile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Kymo\card-look.txt");
-        // The card's settings in force: the recorder's last ones, kept in card-look.txt so that the card starts as it was
-        // set up (locked included) even when the recorder does not answer yet.
-        Look look;
-        string lookSaved = "", lookError = "";       // card-look.txt's text as on disk; the last error saving it
-        public static bool Test;                      // --selftest: no fetching, a made-up snapshot
-        readonly Source source = new Source();
-        readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer { Interval = 1000 };
+        public static bool Test;                      // --selftest: no fetching or sampling, made-up figures
+        protected readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer { Interval = 1000 };
         // After the desktop takes the foreground, Explorer raises it (Show desktop) a moment later: look again
         // every 150 ms for a second, so the card comes to the front without waiting for the next tick.
         readonly System.Windows.Forms.Timer burst = new System.Windows.Forms.Timer { Interval = 150 };
         int burstLeft;
         readonly Native.WinEventProc onForeground;
         IntPtr foregroundHook;
-        Snapshot last;
-        bool fetching, allowZ, locked, displayOff, paused;
+        bool allowZ, locked, displayOff, paused;
+        protected bool hiddenBySetting;              // switched off in the settings: neither shown nor kept in place
         public static bool Trace, AlwaysVisible;
-        double lastFetch = -1e9, lastOpen = -1e9;    // Clock.Now
-        int late;                                    // answers in a row without the sample that should be in
-        int failures;                                // failed requests in a row
-        int drawnMinute = -1;                        // minute of the header clock last drawn
-        float scale = 1;
-        Rectangle work;
-        int width, height;
-        Spot spot;
+        protected double lastOpen = -1e9;            // Clock.Now of the last page opened by a click
+        bool secondPress;                             // the button went down as the second press of a double-click
+        protected float scale = 1;
+        protected Rectangle work;
+        protected int width, height;
+        protected Spot spot;
         DateTime spotStamp;                          // card-placement.txt as last read or written (MinValue: none)
         // Dragging: the left button went down on the card (pressed); it became a drag once the mouse moved a few
         // pixels (dragging), else releasing it is a click. grab is where the card was held, as fractions of its size.
@@ -850,32 +864,40 @@ namespace Kymo
         double startSize, liveSize, startWider, startTaller, liveWider, liveTaller;
         double drawnSize = 100;                       // the size last drawn (smaller than its own when it would not fit)
         int wheelDelta;                               // wheel movement not yet turned into whole percents (120 = 10 %)
-        // Shift + scroll: the background opacity, set on the card and sent to the recorder's settings (where the card's
-        // settings live) a second after the last notch. Until the recorder's answers carry it, the card keeps it.
-        int opacityWheel;                             // wheel movement not yet turned into steps (120 = 5 %)
-        int pendingOpacity = -1;                      // set on the card, not yet in the recorder's answers
-        bool sendingOpacity, resendOpacity;
-        long fetchSerial;                             // fetches started so far
-        long confirmedAfter = -1;                     // the recorder took the pending opacity: answers to later fetches carry it
-        readonly System.Windows.Forms.Timer opacitySend = new System.Windows.Forms.Timer { Interval = 1000 };
-        internal static Func<int, int> SendOpacity;   // for --selftest (else: Source.Post; never in a test)
         readonly System.Windows.Forms.Timer wheelSave = new System.Windows.Forms.Timer { Interval = 1000 };
-        long draws, fetches, pausedTicks, visibleTicks; double drawMs;
+        protected long draws, fetches, pausedTicks, visibleTicks; protected double drawMs;
         double statsAt = Clock.Now;
 
-        public WidgetWindow()
+        // The derived widget sets its title and reads its spot (ReadSpot) once it is set up.
+        protected DeskWindow()
         {
             FormBorderStyle = FormBorderStyle.None; ShowInTaskbar = false; StartPosition = FormStartPosition.Manual;
-            Text = "Kymo card";
-            ReadSpot();
-            look = Look.Read(LookFile);
-            try { lookSaved = File.Exists(LookFile) ? look.ToText() : ""; } catch { }
             timer.Tick += delegate { Tick(); };
             wheelSave.Tick += delegate { wheelSave.Stop(); wheelDelta = 0; SaveSpot("resized"); };
-            opacitySend.Tick += delegate { SendOpacityNow(); };
             burst.Tick += delegate { KeepAboveDesktop(); if (--burstLeft <= 0 || Topmost(Handle)) burst.Stop(); };
             onForeground = OnForeground;
         }
+
+        // ---- what the widget is
+        protected abstract string PlaceFile { get; }                  // its Spot's file
+        protected virtual string WidgetName { get { return ""; } }          // in the log ("" for the card)
+        protected virtual Spot DefaultSpot() { return new Spot(); }   // no file, or a damaged one
+        protected abstract bool PlaceLocked { get; }                  // its place and size locked in the settings
+        protected abstract bool Ready { get; }                        // something to draw
+        // Its size at scale k, stretched by `wider` and `taller` (logical px at 100 %): as it is now, and at the most it
+        // may grow to by itself (the card: with all its issue lines).
+        protected abstract Size Measure(float k, double wider, double taller);
+        protected virtual Size MeasureMost(float k, double wider, double taller) { return Measure(k, wider, taller); }
+        protected abstract Bitmap Render(float k, double wider, double taller);
+        protected abstract void VisibleTick();                        // each second while it can be seen
+        protected virtual void Revealed() { if (Ready) Draw(); }      // in front with Show desktop
+        protected virtual void TestStart() { }                        // --selftest: shown, no timer
+        // A click (no drag), screen px; `second`: the second click of a double-click (the card opens the dashboards
+        // once; the process list does not undo what the first click did).
+        protected abstract void Clicked(Point at, bool second);
+        protected abstract void RightClicked(Point at);
+        protected virtual void OnShiftWheel(int delta) { }
+        protected virtual bool OnPlainWheel(int delta, Point at) { return false; }
 
         protected override CreateParams CreateParams
         {
@@ -903,7 +925,7 @@ namespace Kymo
             base.OnShown(e);
             Place();
             KeepAboveDesktop();
-            if (Test) { last = new Snapshot { Up = true, Look = look }; Draw(); return; }
+            if (Test) { TestStart(); return; }
             Tick();
             timer.Start();
         }
@@ -916,7 +938,7 @@ namespace Kymo
 
         // Work area and scale of the card's monitor, in physical pixels (the process is per-monitor DPI aware): the
         // monitor under the mouse while moving it, else the saved one, or the primary monitor if that one is gone.
-        void Place()
+        protected void Place()
         {
             IntPtr mon = dragging && !resizing ? Native.MonitorAt(lastAt) : Native.FindMonitor(spot.Monitor);
             if (mon == IntPtr.Zero) mon = Native.PrimaryMonitor();
@@ -932,18 +954,16 @@ namespace Kymo
             scale = Native.GetDpiForMonitor(mon, 0, out dx, out dy) == 0 ? dx / 96f : 1f;
         }
 
-        int Px(double logical) { return (int)Math.Round(logical * scale); }
+        protected int Px(double logical) { return (int)Math.Round(logical * scale); }
 
         // The size drawn (% of the usual one), and the drawing scale: the monitor's times that size.
-        double SizeNow { get { return resizing ? liveSize : spot.Size; } }
-        double Wider { get { return resizing ? liveWider : spot.Wider; } }
-        double Taller { get { return resizing ? liveTaller : spot.Taller; } }
-        float K { get { return (float)(scale * SizeNow / 100); } }
-        // Its place and size locked in the settings: no dragging, no resizing.
-        bool PlaceLocked { get { return look.Locked; } }
+        protected double SizeNow { get { return resizing ? liveSize : spot.Size; } }
+        protected double Wider { get { return resizing ? liveWider : spot.Wider; } }
+        protected double Taller { get { return resizing ? liveTaller : spot.Taller; } }
+        protected float K { get { return (float)(scale * SizeNow / 100); } }
 
         // The card's top-left corner: its spot, kept inside the work area (a smaller screen, a taller card).
-        Point Origin()
+        protected Point Origin()
         {
             if (dragging) return dragPos;
             int x = spot.Right ? work.Right - width - Px(spot.X) : work.Left + Px(spot.X);
@@ -994,7 +1014,7 @@ namespace Kymo
             float before = scale;
             Place();
             dragPos = DragOrigin();
-            if (scale != before && last != null) { Draw(); return; }   // onto a monitor with other scaling: drawn again at its size
+            if (scale != before && Ready) { Draw(); return; }   // onto a monitor with other scaling: drawn again at its size
             Native.SetWindowPos(Handle, IntPtr.Zero, dragPos.X, dragPos.Y, 0, 0, Native.SWP_NOSIZE | Native.SWP_NOZORDER | Native.SWP_NOACTIVATE | Native.SWP_NOOWNERZORDER);
         }
 
@@ -1056,8 +1076,8 @@ namespace Kymo
                 // shown). The moved edge goes up to the end of the work area; the card keeps room on the screen for all its
                 // issue lines; and it never loses, the moment it is held, room it was stretched by before.
                 double k = scale * startSize / 100;
-                var now = Card.Measure(look, last != null ? Card.Shown(last).Count : 0, (float)k);   // as made, the lines shown
-                var all = Card.Measure(look, Math.Max(0, Math.Min(6, look.IssueLines)), (float)k);   // as made, all its lines
+                var now = Measure((float)k, 0, 0);       // as made, as it is now (the card: the issue lines shown)
+                var all = MeasureMost((float)k, 0, 0);   // as made, at the most (the card: all its issue lines)
                 double wider = startWider, taller = startTaller;
                 if (across)
                 {
@@ -1071,7 +1091,7 @@ namespace Kymo
                 }
                 if (wider == liveWider && taller == liveTaller) return;
                 liveWider = wider; liveTaller = taller;
-                if (last != null) Draw();
+                if (Ready) Draw();
                 return;
             }
             // At a corner, the movement along the card's diagonal counts.
@@ -1082,7 +1102,7 @@ namespace Kymo
             if (Math.Abs(size - 100) < 4 && fit >= 100) size = 100;
             if (size == liveSize) return;
             liveSize = size;
-            if (last != null) Draw();
+            if (Ready) Draw();
         }
 
         // Stretched room (logical px at 100 %): none below 0 or within 8 px of it (back to as made), at most `most`.
@@ -1096,7 +1116,7 @@ namespace Kymo
         // room its edges were dragged out by).
         double FitSize()
         {
-            var most = Card.Measure(look, Math.Max(0, Math.Min(6, look.IssueLines)), scale, Wider, Taller);
+            var most = MeasureMost(scale, Wider, Taller);
             return Math.Floor(100 * Math.Min(work.Width / (double)most.Width, work.Height / (double)most.Height));
         }
 
@@ -1125,7 +1145,8 @@ namespace Kymo
             Rectangle w; float k;
             Area(mon, out w, out k);
             var s = new Spot { Monitor = Native.DeviceOf(mon), Size = wasResizing ? liveSize : spot.Size,
-                Wider = wasResizing ? liveWider : spot.Wider, Taller = wasResizing ? liveTaller : spot.Taller };
+                Wider = wasResizing ? liveWider : spot.Wider, Taller = wasResizing ? liveTaller : spot.Taller,
+                Opacity = spot.Opacity, Sort = spot.Sort, Ascending = spot.Ascending };
             s.Right = o.X + width / 2.0 > w.Left + w.Width / 2.0;
             s.Bottom = o.Y + height / 2.0 > w.Top + w.Height / 2.0;
             s.X = Math.Max(0, Math.Round((s.Right ? w.Right - (o.X + width) : o.X - w.Left) / k, 1));
@@ -1134,15 +1155,16 @@ namespace Kymo
             wheelSave.Stop();
             SaveSpot(wasResizing ? "resized" : "moved");
             Place();
-            if (last != null) Draw();
+            if (Ready) Draw();
             return true;
         }
 
-        void SaveSpot(string what)
+        protected void SaveSpot(string what)
         {
-            try { spot.Save(PositionFile); spotStamp = Stamp(); }
-            catch (Exception e) { Log("saving the card position: " + e.Message); }
-            Log(what + ": " + spot.Corner + " " + spot.X.ToString(CultureInfo.InvariantCulture) + ", " + spot.Y.ToString(CultureInfo.InvariantCulture) +
+            string who = WidgetName.Length > 0 ? WidgetName + " " : "";
+            try { spot.Save(PlaceFile); spotStamp = Stamp(); }
+            catch (Exception e) { Log("saving the " + (WidgetName.Length > 0 ? WidgetName : "card") + " position: " + e.Message); }
+            Log(who + what + ": " + spot.Corner + " " + spot.X.ToString(CultureInfo.InvariantCulture) + ", " + spot.Y.ToString(CultureInfo.InvariantCulture) +
                 " at " + spot.Size.ToString(CultureInfo.InvariantCulture) + " %" +
                 (spot.Wider > 0 || spot.Taller > 0 ? ", " + spot.Wider.ToString(CultureInfo.InvariantCulture) + " wider and " + spot.Taller.ToString(CultureInfo.InvariantCulture) + " taller" : "") +
                 " on " + spot.Monitor);
@@ -1163,9 +1185,393 @@ namespace Kymo
             double size = Math.Max(Spot.MinSize, Math.Min(Math.Min(Spot.MaxSize, Math.Max(Math.Max(Spot.MinSize, FitSize()), from)), from + steps));
             if (steps > 0 ? size <= from : size >= from) return;
             spot.Size = size;
-            if (last != null) Draw();
+            if (Ready) Draw();
             wheelSave.Stop(); wheelSave.Start();
         }
+
+        // Where the mouse was when the message being handled was made (screen, physical px; signed for monitors
+        // left of or above the primary one), not where it is by the time the card gets to it.
+        protected static Point MessageAt() { uint p = Native.GetMessagePos(); return new Point((short)(p & 0xFFFF), (short)(p >> 16)); }
+
+        DateTime Stamp()
+        {
+            try { return File.Exists(PlaceFile) ? File.GetLastWriteTimeUtc(PlaceFile) : DateTime.MinValue; }
+            catch { return DateTime.MinValue; }
+        }
+
+        // False if the file could not be read just now: the widget keeps its spot and tries again at the next tick.
+        protected bool ReadSpot()
+        {
+            DateTime stamp = Stamp();
+            var s = Spot.Load(PlaceFile, DefaultSpot);
+            if (s == null) { if (spot == null) spot = DefaultSpot(); return false; }
+            spot = s; spotStamp = stamp;
+            return true;
+        }
+
+        // card-placement.txt changed or deleted by hand: the card goes to its new spot.
+        internal void CheckSpotFile()
+        {
+            if (pressed || Stamp() == spotStamp) return;
+            if (!ReadSpot()) return;
+            Log((WidgetName.Length > 0 ? WidgetName : "card") + " position file changed: " + spot.Corner + " " + spot.X.ToString(CultureInfo.InvariantCulture) + ", " + spot.Y.ToString(CultureInfo.InvariantCulture));
+            Place();
+            if (Ready) Draw();
+        }
+
+        // For --selftest.
+        internal Rectangle Bounds2 { get { return new Rectangle(Origin(), new Size(width, height)); } }
+        internal Rectangle WindowRect { get { var r = Native.Bounds(Handle); return Rectangle.FromLTRB(r.Left, r.Top, r.Right, r.Bottom); } }
+        internal Rectangle Work { get { return work; } }
+        internal float DpiScale { get { return scale; } }
+        internal Spot CurrentSpot { get { return spot; } }
+        internal bool Held { get { return pressed; } }
+        internal double SizeShown { get { return SizeNow; } }
+        internal void MouseMovedWithButtonUp() { Native.SendMessage(Handle, 0x0200, IntPtr.Zero, IntPtr.Zero); }
+        internal void CtrlWheel(int delta) { Native.SendMessage(Handle, 0x020A, (IntPtr)((delta << 16) | 0x8), IntPtr.Zero); }
+        internal void ShiftWheel(int delta) { Native.SendMessage(Handle, 0x020A, (IntPtr)((delta << 16) | 0x4), IntPtr.Zero); }
+        internal void FlushWheel() { if (wheelSave.Enabled) { wheelSave.Stop(); SaveSpot("resized"); } }
+
+        protected void Tick()
+        {
+            if (Test || hiddenBySetting) return;
+            KeepAboveDesktop();
+            CheckSpotFile();
+            bool visible = AlwaysVisible || (!locked && !displayOff && !Covered());
+            if (visible == paused && Trace) Log((WidgetName.Length > 0 ? WidgetName + " " : "") + (visible ? "resumed" : "paused (" + (locked ? "locked" : displayOff ? "screen off" : "covered") + ")"));
+            paused = !visible;
+            if (!visible) { pausedTicks++; LogStats(); return; }
+            visibleTicks++;
+            VisibleTick();
+            LogStats();
+        }
+
+        protected static double IdleSeconds()
+        {
+            var li = new Native.LASTINPUTINFO { Size = Marshal.SizeOf(typeof(Native.LASTINPUTINFO)) };
+            Native.GetLastInputInfo(ref li);
+            return (unchecked((uint)Environment.TickCount - li.Time)) / 1000.0;
+        }
+
+        protected void Draw()
+        {
+            if (!Ready || IsDisposed || !IsHandleCreated || work.IsEmpty) return;   // not placed yet (Place sets work)
+            var sw = Stopwatch.StartNew();
+            // Never bigger than the work area: a size chosen while it fitted is drawn smaller for as long as the widget
+            // would not fit (more issue lines, another look from the settings), and comes back after; the saved size stays.
+            float k = K;
+            var full = Measure(k, Wider, Taller);
+            if (full.Width > work.Width || full.Height > work.Height)
+                k *= (float)(Math.Min(work.Width / (double)full.Width, work.Height / (double)full.Height) * 0.998);
+            drawnSize = 100 * k / scale;
+            using (var bmp = Render(k, Wider, Taller))
+            {
+                width = bmp.Width; height = bmp.Height;
+                // The size may have changed: still held at the same point, or by the same corner while resizing.
+                if (dragging) dragPos = resizing ? ResizeOrigin() : DragOrigin();
+                Present(bmp, Origin());
+            }
+            drawMs += sw.Elapsed.TotalMilliseconds; draws++;
+        }
+
+        void Present(Bitmap bmp, Point at)
+        {
+            IntPtr screen = Native.GetDC(IntPtr.Zero), mem = Native.CreateCompatibleDC(screen);
+            IntPtr hbmp = bmp.GetHbitmap(Color.FromArgb(0)), old = Native.SelectObject(mem, hbmp);
+            try
+            {
+                var size = new Native.SIZE(bmp.Width, bmp.Height); var src = new Native.POINT(0, 0); var dst = new Native.POINT(at.X, at.Y);
+                var blend = new Native.BLENDFUNCTION { Op = 0, Flags = 0, Alpha = 255, Format = 1 };   // AC_SRC_OVER, AC_SRC_ALPHA
+                Native.UpdateLayeredWindow(Handle, screen, ref dst, ref size, mem, ref src, 0, ref blend, 2);   // ULW_ALPHA
+            }
+            finally { Native.SelectObject(mem, old); Native.DeleteObject(hbmp); Native.DeleteDC(mem); Native.ReleaseDC(IntPtr.Zero, screen); }
+        }
+
+        // Fully hidden by real windows above it? Other widgets, click-through or see-through overlays and cloaked
+        // windows do not count: the card might show through them, so it keeps drawing.
+        bool Covered()
+        {
+            if (width == 0) return false;
+            Point o = Origin();
+            IntPtr rest = Native.CreateRectRgn(o.X, o.Y, o.X + width, o.Y + height);
+            try
+            {
+                for (IntPtr h = Native.GetTopWindow(IntPtr.Zero); h != IntPtr.Zero; h = Native.GetWindow(h, Native.GW_HWNDNEXT))
+                {
+                    if (h == Handle) return false;            // everything after this is below the card
+                    if (!Native.Shown(h) || Native.IsWidgetOrOverlay(h) || Native.IsDesktop(h)) continue;
+                    var r = Native.Bounds(h);
+                    if (r.Right <= r.Left || r.Bottom <= r.Top) continue;
+                    IntPtr win = Native.CreateRectRgn(r.Left, r.Top, r.Right, r.Bottom);
+                    int kind = Native.CombineRgn(rest, rest, win, Native.RGN_DIFF);
+                    Native.DeleteObject(win);
+                    if (kind == Native.NULLREGION) return true;
+                }
+                return false;
+            }
+            finally { Native.DeleteObject(rest); }
+        }
+
+        // Keep the card directly above the desktop: below every real window, above the wallpaper and icons.
+        // Show desktop raises the desktop above every ordinary window (and Explorer keeps it there): the card then
+        // goes topmost, in front of it, for as long as the desktop is in the foreground and still raised. A plain
+        // click on the wallpaper makes the desktop the foreground window too, but leaves it at the bottom: the card
+        // stays where it is.
+        void KeepAboveDesktop()
+        {
+            if (!IsHandleCreated || hiddenBySetting) return;
+            if (!Native.IsWindowVisible(Handle)) Native.ShowWindow(Handle, 4);   // SW_SHOWNOACTIVATE
+            IntPtr desk = Native.FindWindow("Progman", null);
+            // Explorer restarting: under every window until the new desktop exists, then the walk below places the card.
+            if (desk == IntPtr.Zero) { if (Topmost(Handle)) SetZ(Native.HWND_BOTTOM); return; }
+            IntPtr fg = Native.GetForegroundWindow();
+            if (fg != IntPtr.Zero && Native.IsDesktop(fg) && DesktopRaised(desk))
+            {
+                if (!Topmost(Handle))
+                {
+                    SetZ(Native.HWND_TOPMOST);
+                    if (Trace) Log("show desktop: " + (WidgetName.Length > 0 ? WidgetName : "card") + " in front");
+                    Revealed();
+                }
+                return;
+            }
+            if (!Topmost(Handle))
+            {
+                // Walk down from the card: only hidden windows and other widgets may sit between it and the desktop.
+                for (IntPtr h = Native.GetWindow(Handle, Native.GW_HWNDNEXT); ; h = Native.GetWindow(h, Native.GW_HWNDNEXT))
+                {
+                    if (h == desk) return;                                   // in place
+                    if (h == IntPtr.Zero) break;                             // the card is below the desktop
+                    if (Native.Shown(h) && !Native.IsWidgetOrOverlay(h)) break;   // a real window is below the card
+                }
+            }
+            else if (Trace) Log("show desktop over: card back down");
+            // Insert right after the window above the desktop. If that one is topmost (or is the card), the
+            // desktop heads the ordinary windows: the top of that band is the right place (and not topmost).
+            IntPtr above = Native.GetWindow(desk, Native.GW_HWNDPREV);
+            SetZ(above == IntPtr.Zero || above == Handle || Topmost(above) ? Native.HWND_NOTOPMOST : above);
+        }
+
+        protected static bool Topmost(IntPtr h) { return (Native.ExStyle(h) & Native.WS_EX_TOPMOST) != 0; }
+
+        // Does the desktop head the ordinary windows (Show desktop)? Walk up from it to the topmost band: no shown real
+        // window may sit in between. Widgets (the card included) and hidden or minimized windows do not count.
+        static bool DesktopRaised(IntPtr desk)
+        {
+            for (IntPtr h = Native.GetWindow(desk, Native.GW_HWNDPREV); h != IntPtr.Zero; h = Native.GetWindow(h, Native.GW_HWNDPREV))
+            {
+                if (Topmost(h)) return true;
+                if (Native.Shown(h) && !Native.IsWidgetOrOverlay(h) && !Native.IsDesktop(h)) return false;
+            }
+            return true;
+        }
+
+        void SetZ(IntPtr insertAfter)
+        {
+            if (insertAfter == Handle) return;
+            allowZ = true;
+            try { Native.SetWindowPos(Handle, insertAfter, 0, 0, 0, 0, Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE | Native.SWP_NOOWNERZORDER); }
+            finally { allowZ = false; }
+        }
+
+        void OnForeground(IntPtr hook, uint ev, IntPtr hwnd, int obj, int child, uint thread, uint time)
+        {
+            bool wasTop = Topmost(Handle);
+            KeepAboveDesktop();
+            // Explorer reorders for a moment after the foreground changes, both into Show desktop and out of it.
+            if ((hwnd != IntPtr.Zero && Native.IsDesktop(hwnd) && !Topmost(Handle)) || (wasTop && !Topmost(Handle))) { burstLeft = 7; burst.Start(); }
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            switch (m.Msg)
+            {
+                case 0x0046:   // WM_WINDOWPOSCHANGING: nobody else moves the card in the z-order (no "bring to front" on click)
+                    if (!allowZ)
+                    {
+                        var wp = (Native.WINDOWPOS)Marshal.PtrToStructure(m.LParam, typeof(Native.WINDOWPOS));
+                        wp.Flags |= Native.SWP_NOZORDER;
+                        Marshal.StructureToPtr(wp, m.LParam, false);
+                    }
+                    break;
+                case 0x0021:   // WM_MOUSEACTIVATE: never take the focus
+                    m.Result = (IntPtr)3; return;      // MA_NOACTIVATE
+                // The mouse: WinForms holds the capture from button down to button up, so a drag goes on outside the card.
+                case 0x0201:   // WM_LBUTTONDOWN
+                case 0x0203:   // WM_LBUTTONDBLCLK: the second press of a double-click
+                    secondPress = m.Msg == 0x0203;
+                    Press(MessageAt()); break;
+                case 0x0200:   // WM_MOUSEMOVE; the button already up (its release went elsewhere): the drag ends there
+                    if (pressed) { if ((m.WParam.ToInt64() & 1) == 0) Release(); else DragTo(MessageAt()); }   // MK_LBUTTON
+                    break;
+                case 0x0202:   // WM_LBUTTONUP: the end of a drag, or a click
+                    if (pressed && !Release()) Clicked(MessageAt(), secondPress);
+                    break;
+                case 0x0215:   // WM_CAPTURECHANGED: the mouse taken away mid-drag: the card stays where it is
+                    if (pressed && m.LParam != Handle) Release();
+                    break;
+                case 0x001F:   // WM_CANCELMODE
+                    if (pressed) Release();
+                    break;
+                case 0x0020:   // WM_SETCURSOR: the resize arrows over the card's edges and corners
+                    if ((m.LParam.ToInt64() & 0xFFFF) == 1 && !pressed)   // HTCLIENT
+                    {
+                        Native.POINT p;
+                        Cursor.Current = Native.GetCursorPos(out p) ? CursorFor(ZoneAt(new Point(p.X, p.Y))) : Cursors.Default;
+                        m.Result = (IntPtr)1; return;
+                    }
+                    break;
+                case 0x020A:   // WM_MOUSEWHEEL: with Ctrl held, bigger or smaller; with Shift, more or less opaque
+                    if ((m.WParam.ToInt64() & 0x8) != 0)   // MK_CONTROL
+                    {
+                        Wheel((short)((m.WParam.ToInt64() >> 16) & 0xFFFF));
+                        m.Result = IntPtr.Zero; return;
+                    }
+                    if ((m.WParam.ToInt64() & 0x4) != 0)   // MK_SHIFT
+                    {
+                        OnShiftWheel((short)((m.WParam.ToInt64() >> 16) & 0xFFFF));
+                        m.Result = IntPtr.Zero; return;
+                    }
+                    if (OnPlainWheel((short)((m.WParam.ToInt64() >> 16) & 0xFFFF), MessageAt())) { m.Result = IntPtr.Zero; return; }
+                    break;
+                case 0x0204:   // WM_RBUTTONDOWN (not the second press of a double right-click)
+                    rightDown = !pressed;
+                    break;
+                case 0x0205:   // WM_RBUTTONUP: if let go on the widget
+                    if (rightDown && new Rectangle(Origin(), new Size(width, height)).Contains(MessageAt())) RightClicked(MessageAt());
+                    rightDown = false;
+                    break;
+                case 0x007E:   // WM_DISPLAYCHANGE
+                    Place(); Draw(); break;
+                case 0x02E0:   // WM_DPICHANGED: the card places itself; WinForms would move it to Windows' suggested rectangle
+                    Place(); Draw(); m.Result = IntPtr.Zero; return;
+                case 0x001A:   // WM_SETTINGCHANGE: the work area may have moved (taskbar)
+                    if (m.WParam.ToInt64() == 0x2F) { Place(); Draw(); }
+                    break;
+                case 0x02B1:   // WM_WTSSESSION_CHANGE
+                    int code = m.WParam.ToInt32();
+                    if (code == 7) { locked = true; if (pressed) Release(); }      // WTS_SESSION_LOCK (mid-drag: dropped there)
+                    else if (code == 8) { locked = false; Tick(); }                 // WTS_SESSION_UNLOCK
+                    break;
+                case 0x0218:   // WM_POWERBROADCAST
+                    if (m.WParam.ToInt32() == 0x8013)                               // PBT_POWERSETTINGCHANGE
+                    {
+                        var ps = (Native.POWERBROADCAST_SETTING)Marshal.PtrToStructure(m.LParam, typeof(Native.POWERBROADCAST_SETTING));
+                        displayOff = ps.Data == 0;
+                        if (!displayOff) Tick();
+                    }
+                    break;
+                case 0x0016:   // WM_ENDSESSION
+                    if (m.WParam != IntPtr.Zero) Application.Exit();
+                    break;
+            }
+            base.WndProc(ref m);
+        }
+
+        // A page of the dashboards in the default browser ("/", or "/#/settings?group=desktop-card"), once however fast
+        // the clicks (a double-click is two).
+        protected void Open(string page)
+        {
+            if (Clock.Now - lastOpen <= 2 * SystemInformation.DoubleClickTime / 1000.0) return;
+            lastOpen = Clock.Now;
+            string url = Source.Base + page;
+            if (Trace) Log("open " + url);
+            try
+            {
+                // The browser inherits this process's priority: open it at normal priority.
+                var me = Process.GetCurrentProcess(); var before = me.PriorityClass;
+                me.PriorityClass = ProcessPriorityClass.Normal;
+                Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+                me.PriorityClass = before;
+            }
+            catch (Exception e) { Log("open: " + e.Message); }
+        }
+
+        void LogStats()
+        {
+            if (Clock.Now - statsAt < 3600) return;
+            statsAt = Clock.Now;
+            Log(string.Format(CultureInfo.InvariantCulture, "{5}last hour: {0} s visible, {1} s paused, {2} {6}, {3} draws, {4:0.0} ms per draw",
+                visibleTicks, pausedTicks, fetches, draws, draws > 0 ? drawMs / draws : 0, WidgetName.Length > 0 ? WidgetName + " " : "", WidgetName.Length > 0 ? "samples" : "fetches"));
+            visibleTicks = pausedTicks = fetches = draws = 0; drawMs = 0;
+        }
+
+        public static string LogFile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Kymo\card.log");
+        public static void Log(string text)
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(LogFile));
+                var fi = new FileInfo(LogFile);
+                if (fi.Exists && fi.Length > 256 * 1024) File.Delete(LogFile + ".1");
+                if (fi.Exists && fi.Length > 256 * 1024) File.Move(LogFile, LogFile + ".1");
+                File.AppendAllText(LogFile, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + " " + text + Environment.NewLine);
+            }
+            catch { }
+        }
+    }
+
+
+    // The card: the recorder's figures (/api/card), fetched once each new sample is in. A click opens the dashboards, a
+    // right-click its settings; Shift + scroll sets its background opacity, a setting of the recorder's.
+    sealed class WidgetWindow : DeskWindow
+    {
+        public static string PositionFile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Kymo\card-placement.txt");
+        public static string LookFile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Kymo\card-look.txt");
+        // The card's settings in force: the recorder's last ones, kept in card-look.txt so that the card starts as it was
+        // set up (locked included) even when the recorder does not answer yet.
+        Look look;
+        string lookSaved = "", lookError = "";       // card-look.txt's text as on disk; the last error saving it
+        readonly Source source = new Source();
+        Snapshot last;
+        bool fetching;
+        double lastFetch = -1e9;                     // Clock.Now
+        int late;                                    // answers in a row without the sample that should be in
+        int failures;                                // failed requests in a row
+        int drawnMinute = -1;                        // minute of the header clock last drawn
+        // Shift + scroll: the background opacity, set on the card and sent to the recorder's settings (where the card's
+        // settings live) a second after the last notch. Until the recorder's answers carry it, the card keeps it.
+        int opacityWheel;                             // wheel movement not yet turned into steps (120 = 5 %)
+        int pendingOpacity = -1;                      // set on the card, not yet in the recorder's answers
+        bool sendingOpacity, resendOpacity;
+        long fetchSerial;                             // fetches started so far
+        long confirmedAfter = -1;                     // the recorder took the pending opacity: answers to later fetches carry it
+        readonly System.Windows.Forms.Timer opacitySend = new System.Windows.Forms.Timer { Interval = 1000 };
+        internal static Func<int, int> SendOpacity;   // for --selftest (else: Source.Post; never in a test)
+        // Told each time the recorder's settings arrive (the process list follows its own group of them).
+        internal Action<Look> LookArrived;
+
+        public WidgetWindow()
+        {
+            Text = "Kymo card";
+            look = Look.Read(LookFile);
+            try { lookSaved = File.Exists(LookFile) ? look.ToText() : ""; } catch { }
+            opacitySend.Tick += delegate { SendOpacityNow(); };
+            ReadSpot();
+        }
+
+        internal Look CurrentLook { get { return look; } }
+
+        protected override string PlaceFile { get { return PositionFile; } }
+        protected override bool PlaceLocked { get { return look.Locked; } }
+        protected override bool Ready { get { return last != null; } }
+        protected override Size Measure(float k, double wider, double taller) { return Card.Measure(last.Look, Card.Shown(last).Count, k, wider, taller); }
+        protected override Size MeasureMost(float k, double wider, double taller) { return Card.Measure(look, Math.Max(0, Math.Min(6, look.IssueLines)), k, wider, taller); }
+        protected override Bitmap Render(float k, double wider, double taller) { drawnMinute = DateTime.Now.Minute; return Card.Render(last, k, wider, taller); }
+        protected override void TestStart() { last = new Snapshot { Up = true, Look = look }; Draw(); }
+        protected override void VisibleTick()
+        {
+            if (!fetching && Due()) StartFetch();
+            else if (last != null && DateTime.Now.Minute != drawnMinute) Draw();   // the header clock's new minute
+        }
+        protected override void Revealed()
+        {
+            if (last != null) Draw();
+            if (!fetching && Due()) StartFetch();
+        }
+        protected override void Clicked(Point at, bool second) { Open("/"); }
+        protected override void RightClicked(Point at) { Open("/#/settings?group=desktop-card"); }
+        protected override void OnShiftWheel(int delta) { OpacityWheel(delta); }
 
         // Shift + scroll over the card: its background 5 % more or less opaque a notch, from 40 to 100 % (the Settings
         // page's steps), whatever the wheel's steps. Drawn at once; sent to the recorder a second after the last notch.
@@ -1233,42 +1639,7 @@ namespace Kymo
             if (resendOpacity && s.Failure.Length == 0 && !sendingOpacity && !opacitySend.Enabled) SendOpacityNow();
         }
 
-        // Where the mouse was when the message being handled was made (screen, physical px; signed for monitors
-        // left of or above the primary one), not where it is by the time the card gets to it.
-        static Point MessageAt() { uint p = Native.GetMessagePos(); return new Point((short)(p & 0xFFFF), (short)(p >> 16)); }
-
-        static DateTime Stamp()
-        {
-            try { return File.Exists(PositionFile) ? File.GetLastWriteTimeUtc(PositionFile) : DateTime.MinValue; }
-            catch { return DateTime.MinValue; }
-        }
-
-        // False if the file could not be read just now: the card keeps its spot and tries again at the next tick.
-        bool ReadSpot()
-        {
-            DateTime stamp = Stamp();
-            var s = Spot.Load(PositionFile);
-            if (s == null) { if (spot == null) spot = new Spot(); return false; }
-            spot = s; spotStamp = stamp;
-            return true;
-        }
-
-        // card-placement.txt changed or deleted by hand: the card goes to its new spot.
-        internal void CheckSpotFile()
-        {
-            if (pressed || Stamp() == spotStamp) return;
-            if (!ReadSpot()) return;
-            Log("card position file changed: " + spot.Corner + " " + spot.X.ToString(CultureInfo.InvariantCulture) + ", " + spot.Y.ToString(CultureInfo.InvariantCulture));
-            Place();
-            if (last != null) Draw();
-        }
-
         // For --selftest.
-        internal Rectangle Bounds2 { get { return new Rectangle(Origin(), new Size(width, height)); } }
-        internal Rectangle WindowRect { get { var r = Native.Bounds(Handle); return Rectangle.FromLTRB(r.Left, r.Top, r.Right, r.Bottom); } }
-        internal Rectangle Work { get { return work; } }
-        internal float DpiScale { get { return scale; } }
-        internal Spot CurrentSpot { get { return spot; } }
         internal void ShowIssues(int n)
         {
             var s = new Snapshot { Up = true, Look = look };
@@ -1277,36 +1648,8 @@ namespace Kymo
         }
         internal void SetLook(Look l) { look = last.Look = l; Draw(); }
         internal void Receive(Snapshot s) { Arrived(s); Draw(); }
-        internal bool Held { get { return pressed; } }
-        internal double SizeShown { get { return SizeNow; } }
-        internal void MouseMovedWithButtonUp() { Native.SendMessage(Handle, 0x0200, IntPtr.Zero, IntPtr.Zero); }
-        internal void CtrlWheel(int delta) { Native.SendMessage(Handle, 0x020A, (IntPtr)((delta << 16) | 0x8), IntPtr.Zero); }
-        internal void ShiftWheel(int delta) { Native.SendMessage(Handle, 0x020A, (IntPtr)((delta << 16) | 0x4), IntPtr.Zero); }
         internal int OpacityShown { get { return last != null ? last.Look.Opacity : look.Opacity; } }
         internal void FlushOpacity() { if (opacitySend.Enabled) SendOpacityNow(); }
-        internal void FlushWheel() { if (wheelSave.Enabled) { wheelSave.Stop(); SaveSpot("resized"); } }
-
-        void Tick()
-        {
-            if (Test) return;
-            KeepAboveDesktop();
-            CheckSpotFile();
-            bool visible = AlwaysVisible || (!locked && !displayOff && !Covered());
-            if (visible == paused && Trace) Log(visible ? "resumed" : "paused (" + (locked ? "locked" : displayOff ? "screen off" : "covered") + ")");
-            paused = !visible;
-            if (!visible) { pausedTicks++; LogStats(); return; }
-            visibleTicks++;
-            if (!fetching && Due()) StartFetch();
-            else if (last != null && DateTime.Now.Minute != drawnMinute) Draw();   // the header clock's new minute
-            LogStats();
-        }
-
-        static double IdleSeconds()
-        {
-            var li = new Native.LASTINPUTINFO { Size = Marshal.SizeOf(typeof(Native.LASTINPUTINFO)) };
-            Native.GetLastInputInfo(ref li);
-            return (unchecked((uint)Environment.TickCount - li.Time)) / 1000.0;
-        }
 
         // Fetch once each new sample is in: the recorder samples every 10 s (interval_s), so a second after the next
         // sample's time; after 5 minutes without input, every third sample. A sample that should be in but is not is
@@ -1368,6 +1711,7 @@ namespace Kymo
                 }
             }
             KeepPendingOpacity(s);
+            if (LookArrived != null) LookArrived(s.Look);
             // The same sample again while the next one should be in: the recorder is late.
             bool same = last != null && s.SampleTs == last.SampleTs;   // NaN never equals
             late = same && Source.UnixNow() >= s.SampleTs + s.Interval + 1 ? late + 1 : 0;
@@ -1375,264 +1719,6 @@ namespace Kymo
                 Log((double.IsNaN(s.SampleTs) ? "no sample" : "sample of " + s.At.ToString("HH:mm:ss", CultureInfo.InvariantCulture)) +
                     (s.Issues.Count > 0 ? " (" + s.Issues[0].Text + ")" : "") + (late > 0 ? ", no newer one yet (" + late + ")" : ""));
             last = s;
-        }
-
-        void Draw()
-        {
-            if (last == null || IsDisposed) return;
-            drawnMinute = DateTime.Now.Minute;
-            var sw = Stopwatch.StartNew();
-            // Never bigger than the work area: a size chosen while it fitted is drawn smaller for as long as the card would
-            // not fit (more issue lines, another look from the settings), and comes back after; the saved size stays.
-            float k = K;
-            var full = Card.Measure(last.Look, Card.Shown(last).Count, k, Wider, Taller);
-            if (full.Width > work.Width || full.Height > work.Height)
-                k *= (float)(Math.Min(work.Width / (double)full.Width, work.Height / (double)full.Height) * 0.998);
-            drawnSize = 100 * k / scale;
-            using (var bmp = Card.Render(last, k, Wider, Taller))
-            {
-                width = bmp.Width; height = bmp.Height;
-                // The size may have changed: still held at the same point, or by the same corner while resizing.
-                if (dragging) dragPos = resizing ? ResizeOrigin() : DragOrigin();
-                Present(bmp, Origin());
-            }
-            drawMs += sw.Elapsed.TotalMilliseconds; draws++;
-        }
-
-        void Present(Bitmap bmp, Point at)
-        {
-            IntPtr screen = Native.GetDC(IntPtr.Zero), mem = Native.CreateCompatibleDC(screen);
-            IntPtr hbmp = bmp.GetHbitmap(Color.FromArgb(0)), old = Native.SelectObject(mem, hbmp);
-            try
-            {
-                var size = new Native.SIZE(bmp.Width, bmp.Height); var src = new Native.POINT(0, 0); var dst = new Native.POINT(at.X, at.Y);
-                var blend = new Native.BLENDFUNCTION { Op = 0, Flags = 0, Alpha = 255, Format = 1 };   // AC_SRC_OVER, AC_SRC_ALPHA
-                Native.UpdateLayeredWindow(Handle, screen, ref dst, ref size, mem, ref src, 0, ref blend, 2);   // ULW_ALPHA
-            }
-            finally { Native.SelectObject(mem, old); Native.DeleteObject(hbmp); Native.DeleteDC(mem); Native.ReleaseDC(IntPtr.Zero, screen); }
-        }
-
-        // Fully hidden by real windows above it? Other widgets, click-through or see-through overlays and cloaked
-        // windows do not count: the card might show through them, so it keeps drawing.
-        bool Covered()
-        {
-            if (width == 0) return false;
-            Point o = Origin();
-            IntPtr rest = Native.CreateRectRgn(o.X, o.Y, o.X + width, o.Y + height);
-            try
-            {
-                for (IntPtr h = Native.GetTopWindow(IntPtr.Zero); h != IntPtr.Zero; h = Native.GetWindow(h, Native.GW_HWNDNEXT))
-                {
-                    if (h == Handle) return false;            // everything after this is below the card
-                    if (!Native.Shown(h) || Native.IsWidgetOrOverlay(h) || Native.IsDesktop(h)) continue;
-                    var r = Native.Bounds(h);
-                    if (r.Right <= r.Left || r.Bottom <= r.Top) continue;
-                    IntPtr win = Native.CreateRectRgn(r.Left, r.Top, r.Right, r.Bottom);
-                    int kind = Native.CombineRgn(rest, rest, win, Native.RGN_DIFF);
-                    Native.DeleteObject(win);
-                    if (kind == Native.NULLREGION) return true;
-                }
-                return false;
-            }
-            finally { Native.DeleteObject(rest); }
-        }
-
-        // Keep the card directly above the desktop: below every real window, above the wallpaper and icons.
-        // Show desktop raises the desktop above every ordinary window (and Explorer keeps it there): the card then
-        // goes topmost, in front of it, for as long as the desktop is in the foreground and still raised. A plain
-        // click on the wallpaper makes the desktop the foreground window too, but leaves it at the bottom: the card
-        // stays where it is.
-        void KeepAboveDesktop()
-        {
-            if (!IsHandleCreated) return;
-            if (!Native.IsWindowVisible(Handle)) Native.ShowWindow(Handle, 4);   // SW_SHOWNOACTIVATE
-            IntPtr desk = Native.FindWindow("Progman", null);
-            // Explorer restarting: under every window until the new desktop exists, then the walk below places the card.
-            if (desk == IntPtr.Zero) { if (Topmost(Handle)) SetZ(Native.HWND_BOTTOM); return; }
-            IntPtr fg = Native.GetForegroundWindow();
-            if (fg != IntPtr.Zero && Native.IsDesktop(fg) && DesktopRaised(desk))
-            {
-                if (!Topmost(Handle))
-                {
-                    SetZ(Native.HWND_TOPMOST);
-                    if (Trace) Log("show desktop: card in front");
-                    if (last != null) Draw();
-                    if (!fetching && Due()) StartFetch();
-                }
-                return;
-            }
-            if (!Topmost(Handle))
-            {
-                // Walk down from the card: only hidden windows and other widgets may sit between it and the desktop.
-                for (IntPtr h = Native.GetWindow(Handle, Native.GW_HWNDNEXT); ; h = Native.GetWindow(h, Native.GW_HWNDNEXT))
-                {
-                    if (h == desk) return;                                   // in place
-                    if (h == IntPtr.Zero) break;                             // the card is below the desktop
-                    if (Native.Shown(h) && !Native.IsWidgetOrOverlay(h)) break;   // a real window is below the card
-                }
-            }
-            else if (Trace) Log("show desktop over: card back down");
-            // Insert right after the window above the desktop. If that one is topmost (or is the card), the
-            // desktop heads the ordinary windows: the top of that band is the right place (and not topmost).
-            IntPtr above = Native.GetWindow(desk, Native.GW_HWNDPREV);
-            SetZ(above == IntPtr.Zero || above == Handle || Topmost(above) ? Native.HWND_NOTOPMOST : above);
-        }
-
-        static bool Topmost(IntPtr h) { return (Native.ExStyle(h) & Native.WS_EX_TOPMOST) != 0; }
-
-        // Does the desktop head the ordinary windows (Show desktop)? Walk up from it to the topmost band: no shown real
-        // window may sit in between. Widgets (the card included) and hidden or minimized windows do not count.
-        static bool DesktopRaised(IntPtr desk)
-        {
-            for (IntPtr h = Native.GetWindow(desk, Native.GW_HWNDPREV); h != IntPtr.Zero; h = Native.GetWindow(h, Native.GW_HWNDPREV))
-            {
-                if (Topmost(h)) return true;
-                if (Native.Shown(h) && !Native.IsWidgetOrOverlay(h) && !Native.IsDesktop(h)) return false;
-            }
-            return true;
-        }
-
-        void SetZ(IntPtr insertAfter)
-        {
-            if (insertAfter == Handle) return;
-            allowZ = true;
-            try { Native.SetWindowPos(Handle, insertAfter, 0, 0, 0, 0, Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE | Native.SWP_NOOWNERZORDER); }
-            finally { allowZ = false; }
-        }
-
-        void OnForeground(IntPtr hook, uint ev, IntPtr hwnd, int obj, int child, uint thread, uint time)
-        {
-            bool wasTop = Topmost(Handle);
-            KeepAboveDesktop();
-            // Explorer reorders for a moment after the foreground changes, both into Show desktop and out of it.
-            if ((hwnd != IntPtr.Zero && Native.IsDesktop(hwnd) && !Topmost(Handle)) || (wasTop && !Topmost(Handle))) { burstLeft = 7; burst.Start(); }
-        }
-
-        protected override void WndProc(ref Message m)
-        {
-            switch (m.Msg)
-            {
-                case 0x0046:   // WM_WINDOWPOSCHANGING: nobody else moves the card in the z-order (no "bring to front" on click)
-                    if (!allowZ)
-                    {
-                        var wp = (Native.WINDOWPOS)Marshal.PtrToStructure(m.LParam, typeof(Native.WINDOWPOS));
-                        wp.Flags |= Native.SWP_NOZORDER;
-                        Marshal.StructureToPtr(wp, m.LParam, false);
-                    }
-                    break;
-                case 0x0021:   // WM_MOUSEACTIVATE: never take the focus
-                    m.Result = (IntPtr)3; return;      // MA_NOACTIVATE
-                // The mouse: WinForms holds the capture from button down to button up, so a drag goes on outside the card.
-                case 0x0201:   // WM_LBUTTONDOWN
-                case 0x0203:   // WM_LBUTTONDBLCLK: the second press of a double-click
-                    Press(MessageAt()); break;
-                case 0x0200:   // WM_MOUSEMOVE; the button already up (its release went elsewhere): the drag ends there
-                    if (pressed) { if ((m.WParam.ToInt64() & 1) == 0) Release(); else DragTo(MessageAt()); }   // MK_LBUTTON
-                    break;
-                case 0x0202:   // WM_LBUTTONUP: the end of a drag, or a click: open the dashboards, once for a double-click
-                    if (pressed && !Release() && Clock.Now - lastOpen > 2 * SystemInformation.DoubleClickTime / 1000.0) { lastOpen = Clock.Now; Open("/"); }
-                    break;
-                case 0x0215:   // WM_CAPTURECHANGED: the mouse taken away mid-drag: the card stays where it is
-                    if (pressed && m.LParam != Handle) Release();
-                    break;
-                case 0x001F:   // WM_CANCELMODE
-                    if (pressed) Release();
-                    break;
-                case 0x0020:   // WM_SETCURSOR: the resize arrows over the card's edges and corners
-                    if ((m.LParam.ToInt64() & 0xFFFF) == 1 && !pressed)   // HTCLIENT
-                    {
-                        Native.POINT p;
-                        Cursor.Current = Native.GetCursorPos(out p) ? CursorFor(ZoneAt(new Point(p.X, p.Y))) : Cursors.Default;
-                        m.Result = (IntPtr)1; return;
-                    }
-                    break;
-                case 0x020A:   // WM_MOUSEWHEEL: with Ctrl held, bigger or smaller; with Shift, more or less opaque
-                    if ((m.WParam.ToInt64() & 0x8) != 0)   // MK_CONTROL
-                    {
-                        Wheel((short)((m.WParam.ToInt64() >> 16) & 0xFFFF));
-                        m.Result = IntPtr.Zero; return;
-                    }
-                    if ((m.WParam.ToInt64() & 0x4) != 0)   // MK_SHIFT
-                    {
-                        OpacityWheel((short)((m.WParam.ToInt64() >> 16) & 0xFFFF));
-                        m.Result = IntPtr.Zero; return;
-                    }
-                    break;
-                case 0x0204:   // WM_RBUTTONDOWN (not the second press of a double right-click)
-                    rightDown = !pressed;
-                    break;
-                case 0x0205:   // WM_RBUTTONUP: the card's settings, if let go on the card; once, however fast the clicks
-                    if (rightDown && new Rectangle(Origin(), new Size(width, height)).Contains(MessageAt()) && Clock.Now - lastOpen > 2 * SystemInformation.DoubleClickTime / 1000.0)
-                    {
-                        lastOpen = Clock.Now;
-                        Open("/#/settings?group=desktop-card");
-                    }
-                    rightDown = false;
-                    break;
-                case 0x007E:   // WM_DISPLAYCHANGE
-                    Place(); Draw(); break;
-                case 0x02E0:   // WM_DPICHANGED: the card places itself; WinForms would move it to Windows' suggested rectangle
-                    Place(); Draw(); m.Result = IntPtr.Zero; return;
-                case 0x001A:   // WM_SETTINGCHANGE: the work area may have moved (taskbar)
-                    if (m.WParam.ToInt64() == 0x2F) { Place(); Draw(); }
-                    break;
-                case 0x02B1:   // WM_WTSSESSION_CHANGE
-                    int code = m.WParam.ToInt32();
-                    if (code == 7) { locked = true; if (pressed) Release(); }      // WTS_SESSION_LOCK (mid-drag: dropped there)
-                    else if (code == 8) { locked = false; Tick(); }                 // WTS_SESSION_UNLOCK
-                    break;
-                case 0x0218:   // WM_POWERBROADCAST
-                    if (m.WParam.ToInt32() == 0x8013)                               // PBT_POWERSETTINGCHANGE
-                    {
-                        var ps = (Native.POWERBROADCAST_SETTING)Marshal.PtrToStructure(m.LParam, typeof(Native.POWERBROADCAST_SETTING));
-                        displayOff = ps.Data == 0;
-                        if (!displayOff) Tick();
-                    }
-                    break;
-                case 0x0016:   // WM_ENDSESSION
-                    if (m.WParam != IntPtr.Zero) Application.Exit();
-                    break;
-            }
-            base.WndProc(ref m);
-        }
-
-        // A page of the dashboards in the default browser ("/", or "/#/settings?group=desktop-card").
-        void Open(string page)
-        {
-            string url = Source.Base + page;
-            if (Trace) Log("open " + url);
-            try
-            {
-                // The browser inherits this process's priority: open it at normal priority.
-                var me = Process.GetCurrentProcess(); var before = me.PriorityClass;
-                me.PriorityClass = ProcessPriorityClass.Normal;
-                Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
-                me.PriorityClass = before;
-            }
-            catch (Exception e) { Log("open: " + e.Message); }
-        }
-
-        void LogStats()
-        {
-            if (Clock.Now - statsAt < 3600) return;
-            statsAt = Clock.Now;
-            Log(string.Format(CultureInfo.InvariantCulture, "last hour: {0} s visible, {1} s paused, {2} fetches, {3} draws, {4:0.0} ms per draw",
-                visibleTicks, pausedTicks, fetches, draws, draws > 0 ? drawMs / draws : 0));
-            visibleTicks = pausedTicks = fetches = draws = 0; drawMs = 0;
-        }
-
-        public static string LogFile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Kymo\card.log");
-        public static void Log(string text)
-        {
-            try
-            {
-                Directory.CreateDirectory(Path.GetDirectoryName(LogFile));
-                var fi = new FileInfo(LogFile);
-                if (fi.Exists && fi.Length > 256 * 1024) File.Delete(LogFile + ".1");
-                if (fi.Exists && fi.Length > 256 * 1024) File.Move(LogFile, LogFile + ".1");
-                File.AppendAllText(LogFile, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + " " + text + Environment.NewLine);
-            }
-            catch { }
         }
     }
 
@@ -2021,6 +2107,26 @@ namespace Kymo
                 return 0;
             }
 
+            if (args.Length >= 2 && args[0] == "--snapshot-processes")
+            {
+                var pairs = Look.Pairs(args.Skip(2));
+                Func<string, double> room = key => pairs.ContainsKey(key) && pairs[key] is int ? Math.Max(0, Math.Min(Spot.MaxRoom, (int)pairs[key])) : 0;
+                using (var sampler = new ProcSampler())
+                {
+                    sampler.Read();
+                    Thread.Sleep(1000);
+                    var r = sampler.Read();
+                    var procLook = ProcLook.From(pairs, "");
+                    var cols = ProcTable.Shown(procLook, !double.IsNaN(r.Gpu));
+                    var rows = ProcTable.Rows(r, procLook.Group, Col.Memory, false, new HashSet<string>());
+                    var ms = new ProcNative.MEMORYSTATUSEX { Length = Marshal.SizeOf(typeof(ProcNative.MEMORYSTATUSEX)) };
+                    ProcNative.GlobalMemoryStatusEx(ref ms);
+                    using (var bmp = ProcTable.Render(r, rows, cols, Col.Memory, false, new HashSet<string>(), 0, 1.5f, room("wider"), room("taller"), 85, ms.TotalPhys, new ProcTable.Hits()))
+                        bmp.Save(args[1], ImageFormat.Png);
+                }
+                return 0;
+            }
+
             if (args.Length >= 1 && args[0] == "--selftest")
             {
                 if (args.Length != 2) return 98;   // never the real card by mistake
@@ -2029,6 +2135,8 @@ namespace Kymo
                 WidgetWindow.PositionFile = Path.Combine(dir, "card-placement.txt");
                 WidgetWindow.LogFile = Path.Combine(dir, "card.log");
                 WidgetWindow.LookFile = Path.Combine(dir, "card-look.txt");
+                ProcessWindow.PlacementFile = Path.Combine(dir, "processes-placement.txt");
+                if (File.Exists(ProcessWindow.PlacementFile)) File.Delete(ProcessWindow.PlacementFile);
                 if (File.Exists(WidgetWindow.PositionFile)) File.Delete(WidgetWindow.PositionFile);
                 if (File.Exists(WidgetWindow.LookFile)) File.Delete(WidgetWindow.LookFile);
                 WidgetWindow.Test = true;
@@ -2036,7 +2144,7 @@ namespace Kymo
                 var w = new WidgetWindow();
                 w.Shown += (o, e) => w.BeginInvoke((MethodInvoker)delegate
                 {
-                    try { code = SelfTest.Run(w); }
+                    try { code = SelfTest.Run(w); code += ProcSelfTest.Run(w); }
                     catch (Exception ex) { WidgetWindow.Log("error: " + ex); code = 99; }
                     w.Close();
                 });
@@ -2053,7 +2161,11 @@ namespace Kymo
                 Application.ThreadException += (o, e) => WidgetWindow.Log("error: " + e.Exception);
                 AppDomain.CurrentDomain.UnhandledException += (o, e) => WidgetWindow.Log("fatal: " + e.ExceptionObject);
                 WidgetWindow.Log("started");
-                Application.Run(new WidgetWindow());
+                var card = new WidgetWindow();
+                var procs = new ProcessWindow(card);
+                card.LookArrived = procs.Apply;
+                card.Shown += delegate { procs.Start(); };
+                Application.Run(card);
                 WidgetWindow.Log("stopped");
             }
             return 0;

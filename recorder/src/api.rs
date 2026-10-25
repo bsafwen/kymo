@@ -957,6 +957,7 @@ fn card(shared: &Shared, root: &Path) -> String {
     number(&mut o, crate::interval_ms() as f64 / 1000.0);
     cfg.write_limits(&mut o);
     cfg.write_card(&mut o);
+    cfg.write_procs(&mut o);
     let head = |o: &mut String, status: &str, ts: i64| {
         key(o, "status", false);
         string(o, status);

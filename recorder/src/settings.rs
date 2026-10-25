@@ -452,6 +452,104 @@ pub static FIELDS: &[Field] = &[
         kind: Kind::Bool,
         default: || Value::Bool(false),
     },
+    // Process list: the desktop widget of every process, next to the card (sent with /api/card as
+    // "processes"). Its place, size, opacity and sort are its own: set on the desktop.
+    Field {
+        key: "procs_show",
+        group: "Process list",
+        label: "Show it on the desktop",
+        help: "A list of every process of this PC, like Task Manager's, next to the card. Click a column title to sort by it, an app to see its processes; scroll over it for more.",
+        kind: Kind::Bool,
+        default: || Value::Bool(true),
+    },
+    Field {
+        key: "procs_pid",
+        group: "Process list",
+        label: "PID column",
+        help: "",
+        kind: Kind::Bool,
+        default: || Value::Bool(true),
+    },
+    Field {
+        key: "procs_cpu",
+        group: "Process list",
+        label: "CPU column",
+        help: "Its share of all the CPU, as Task Manager counts it.",
+        kind: Kind::Bool,
+        default: || Value::Bool(true),
+    },
+    Field {
+        key: "procs_memory",
+        group: "Process list",
+        label: "Memory column",
+        help: "Private working set: the memory only this process uses, in RAM now (Task Manager's Memory column).",
+        kind: Kind::Bool,
+        default: || Value::Bool(true),
+    },
+    Field {
+        key: "procs_io",
+        group: "Process list",
+        label: "I/O column",
+        help: "What it reads and writes per second: files, devices and the network, not only the disk.",
+        kind: Kind::Bool,
+        default: || Value::Bool(true),
+    },
+    Field {
+        key: "procs_gpu",
+        group: "Process list",
+        label: "GPU column",
+        help: "Its busiest GPU engine (3D, video, copy...), as Task Manager shows it.",
+        kind: Kind::Bool,
+        default: || Value::Bool(true),
+    },
+    Field {
+        key: "procs_threads",
+        group: "Process list",
+        label: "Threads column",
+        help: "",
+        kind: Kind::Bool,
+        default: || Value::Bool(false),
+    },
+    Field {
+        key: "procs_handles",
+        group: "Process list",
+        label: "Handles column",
+        help: "",
+        kind: Kind::Bool,
+        default: || Value::Bool(false),
+    },
+    Field {
+        key: "procs_commit",
+        group: "Process list",
+        label: "Commit column",
+        help: "Private bytes: the memory it has committed, in RAM or in the page file.",
+        kind: Kind::Bool,
+        default: || Value::Bool(false),
+    },
+    Field {
+        key: "procs_group",
+        group: "Process list",
+        label: "One row per app",
+        help: "The processes of one program in one row, with their count; click it to see each one. Off: one row per process.",
+        kind: Kind::Bool,
+        default: || Value::Bool(true),
+    },
+    Field {
+        key: "procs_interval",
+        group: "Process list",
+        label: "Update every",
+        help: "How often the list is read again, while it can be seen.",
+        kind: Kind::Choice(&[(1, "1 s"), (2, "2 s"), (5, "5 s")]),
+        default: || Value::Int(2),
+    },
+    Field {
+        key: "procs_locked",
+        group: "Process list",
+        label: "Lock its place and size",
+        help: "Dragging and resizing are off; clicks still sort and open apps.",
+        kind: Kind::Bool,
+        default: || Value::Bool(false),
+    },
     // Display.
     Field {
         key: "refresh",
@@ -893,6 +991,24 @@ impl Settings {
         o.push('}');
     }
 
+    /// What the process list shows, as `"processes":{...}` after the caller's fields: the "Process
+    /// list" group without its "procs_" prefix.
+    pub fn write_procs(&self, o: &mut String) {
+        key(o, "processes", false);
+        o.push('{');
+        let mut first = true;
+        for (f, v) in FIELDS
+            .iter()
+            .zip(&self.values)
+            .filter(|(f, _)| f.group == "Process list")
+        {
+            key(o, f.key.trim_start_matches("procs_"), first);
+            first = false;
+            write_value(o, v);
+        }
+        o.push('}');
+    }
+
     /// All values by key, for logging what changed.
     pub fn diff(&self, other: &Settings) -> Vec<String> {
         FIELDS
@@ -1056,6 +1172,24 @@ mod tests {
         assert!(Settings::default()
             .with(&ch(&[("card_issue_lines", "0")]))
             .is_ok());
+    }
+
+    #[test]
+    fn process_list_options() {
+        let s = Settings::default()
+            .with(&ch(&[
+                ("procs_threads", "on"),
+                ("procs_interval", "5"),
+                ("procs_group", "off"),
+            ]))
+            .unwrap();
+        let mut o = String::from("{\"x\":0");
+        s.write_procs(&mut o);
+        o.push('}');
+        assert_eq!(o, "{\"x\":0,\"processes\":{\"show\":true,\"pid\":true,\"cpu\":true,\"memory\":true,\"io\":true,\"gpu\":true,\"threads\":true,\"handles\":false,\"commit\":false,\"group\":false,\"interval\":5,\"locked\":false}}");
+        assert!(Settings::default()
+            .with(&ch(&[("procs_interval", "3")]))
+            .is_err());
     }
 
     #[test]
