@@ -87,6 +87,8 @@ namespace Kymo
         [DllImport("user32.dll")] public static extern uint GetMessagePos();
         [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT pt);
         [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
+        [StructLayout(LayoutKind.Sequential)] public struct TRACKMOUSEEVENT { public int Size; public uint Flags; public IntPtr Track; public uint HoverTime; }
+        [DllImport("user32.dll")] public static extern bool TrackMouseEvent(ref TRACKMOUSEEVENT e);
         [DllImport("shcore.dll")] public static extern int GetDpiForMonitor(IntPtr mon, int type, out uint dpiX, out uint dpiY);
         [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr ctx);
         [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO info);
@@ -248,6 +250,9 @@ namespace Kymo
         public readonly Dictionary<string, double> V = new Dictionary<string, double>();
         public readonly List<Issue> Issues = new List<Issue>();
         public string TopCpu = "", TopMem = "";
+        // The app behind an issue, where one can be named: the most I/O and the most hard page faults over 5 minutes
+        // (the recorder's), the busiest on the GPU and the one with the most GPU memory (read by the card itself).
+        public string TopIo = "", TopFaults = "", TopGpu = "", TopVram = "";
         public Dictionary<string, double[]> Series = new Dictionary<string, double[]>();
         public string Drive = "C:";
         public string Status = "";             // the recorder's: ok, starting, resuming, stale
@@ -303,10 +308,11 @@ namespace Kymo
             { "qemu-system-x86_64-headless", "Android emulator" }, { "qemu-system-x86_64", "Android emulator" }, { "MsMpEng", "Defender" },
             { "studio64", "Android Studio" }, { "msedgewebview2", "WebView2" }, { "Memory Compression", "Memory compression" },
         };
-        static string Short(string name)
+        // An app's name as the card shows it: its friendly name if known, cut to `max` characters.
+        internal static string Short(string name, int max = 20)
         {
-            string f; if (Friendly.TryGetValue(name, out f)) return f;
-            return name.Length > 20 ? name.Substring(0, 19) + "\u2026" : name;
+            string f; if (Friendly.TryGetValue(name, out f)) name = f;
+            return name.Length > max ? name.Substring(0, max - 1) + "\u2026" : name;
         }
 
         static string Get(string path)
@@ -439,11 +445,19 @@ namespace Kymo
                 if (!double.IsNaN(commitMax) && commitMax > 0) { s.V["commitMax"] = commitMax; if (!double.IsNaN(committed)) s.V["commitOfMax"] = 100 * committed / commitMax; }
 
                 var top = Map(root, "top");
-                Func<string, string> topText = (k) => { var a = Map(top, k); double v = Num(a, "value"); return a == null || double.IsNaN(v) ? "" : Short(Text(a, "name")) + " " + (k == "cpu" ? Pct(v) : Bytes(v)); };
+                Func<string, string> topText = (k) =>
+                {
+                    var a = Map(top, k); double v = Num(a, "value");
+                    if (a == null || double.IsNaN(v)) return "";
+                    return Short(Text(a, "name"), 16) + (k == "faults" ? Share(a) : " " + (k == "cpu" ? Pct(v) : k == "io" ? Rate(v) : Bytes(v)));
+                };
                 s.TopCpu = topText("cpu");
                 s.TopMem = topText("mem");
+                s.TopIo = topText("io");
+                s.TopFaults = topText("faults");
+                GpuTops(s);
                 var topCommit = Map(top, "commit");
-                AddIssues(s, Num(topCommit, "value"), Short(Text(topCommit, "name")));
+                AddIssues(s, Num(topCommit, "value"), Short(Text(topCommit, "name"), 16));
                 s.Series = Lines(Map(root, "hour"), s.Get("commitMax"));
             }
             catch (Exception e)
@@ -513,7 +527,89 @@ namespace Kymo
         }
         public static string Level(double v, double warn, double crit) { return v >= crit ? "crit" : v >= warn ? "warn" : "ok"; }
 
-        static void AddIssues(Snapshot s, double topCommit, string topCommitProc)
+        // The busiest app on the GPU when it is hot, and the one with the most GPU memory when that is full, from the
+        // counters Task Manager uses, an app's processes added up. Only the GPU the recorder reports on counts (NVML: the
+        // NVIDIA one), taken as the one with the most dedicated memory in use: an integrated GPU's apps are left out. GPU use is a rate between two readings, so its
+        // counters are read at every answer while the GPU is warm (5 degrees under the orange threshold), busy (half
+        // its use) or hot, and 5 minutes after: the app is known when the issue shows. An app is named only with a real
+        // part in it: a fifth of the GPU, or 256 MB of its memory. Counters that cannot be opened are tried again after
+        // 10 minutes.
+        GpuEngines gpuUse;
+        GpuProcessMemory gpuMemory;
+        double gpuWarmUntil = -1e9, gpuUseFailed = -1e9, gpuMemoryFailed = -1e9;
+
+        void GpuTops(Snapshot s)
+        {
+            double temp = s.Get("gpuTemp"), vram = s.Get("vram"), util = s.Get("gpu");
+            bool hot = !double.IsNaN(temp) && temp >= s.Lim("gpu_temp_warn");
+            bool full = !double.IsNaN(vram) && vram >= s.Lim("vram_full");
+            if (hot || (!double.IsNaN(temp) && temp >= s.Lim("gpu_temp_warn") - 5) || (!double.IsNaN(util) && util >= 50)) gpuWarmUntil = Clock.Now + 300;
+            try
+            {
+                if (Clock.Now > gpuWarmUntil) { if (gpuUse != null) { gpuUse.Dispose(); gpuUse = null; } }
+                else if (gpuUse == null && Clock.Now - gpuUseFailed > 600) { gpuUse = GpuEngines.Open(); if (gpuUse == null) gpuUseFailed = Clock.Now; }
+                if (!full && gpuUse == null) { if (gpuMemory != null) { gpuMemory.Dispose(); gpuMemory = null; } }
+                else if (gpuMemory == null && Clock.Now - gpuMemoryFailed > 600) { gpuMemory = GpuProcessMemory.Open(); if (gpuMemory == null) gpuMemoryFailed = Clock.Now; }
+
+                var memory = gpuMemory != null ? gpuMemory.ReadByAdapter() : null;
+                string adapter = memory == null || memory.Count == 0 ? null : memory.OrderByDescending(kv => kv.Value.Values.Sum()).First().Key;
+                Dictionary<int, string> names = null;
+                if (gpuUse != null)
+                {
+                    double total;
+                    var use = gpuUse.Read(out total, adapter);   // read at every answer while open: the rate covers one interval
+                    if (hot && use != null)
+                    {
+                        var top = TopByName(use, ref names, true);
+                        if (top != null && top.Item2 >= 20) s.TopGpu = Short(top.Item1, 16) + " " + Whole(top.Item2) + " %";
+                    }
+                }
+                if (full && adapter != null)
+                {
+                    var top = TopByName(memory[adapter], ref names, false);
+                    if (top != null && top.Item2 >= 256 * 1048576.0) s.TopVram = Short(top.Item1, 16) + " " + Bytes(top.Item2);
+                }
+            }
+            catch (Exception e) { WidgetWindow.Log("GPU per process: " + e.Message); }
+        }
+
+        // Values per process ID added up per app name (GPU use: at most 100 %); the biggest, if above 0. The names come
+        // from one list of the processes, made the first time it is needed.
+        static Tuple<string, double> TopByName(Dictionary<int, double> byPid, ref Dictionary<int, string> names, bool percent)
+        {
+            if (byPid == null || byPid.Count == 0) return null;
+            if (names == null)
+            {
+                names = new Dictionary<int, string>();
+                foreach (var p in Process.GetProcesses()) using (p) { try { names[p.Id] = p.ProcessName; } catch { } }
+            }
+            var byName = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kv in byPid)
+            {
+                string name;
+                if (kv.Value <= 0 || !names.TryGetValue(kv.Key, out name)) continue;
+                double x;
+                byName[name] = (byName.TryGetValue(name, out x) ? x : 0) + kv.Value;
+                if (percent) byName[name] = Math.Min(100, byName[name]);
+            }
+            var best = byName.OrderByDescending(kv => kv.Value).ThenBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase).FirstOrDefault();
+            return best.Key == null ? null : Tuple.Create(best.Key, best.Value);
+        }
+
+        // The paging app's part of the PC's page reads ("pager 60 %").
+        static string Share(Dictionary<string, object> a)
+        {
+            double share = Num(a, "share");
+            return double.IsNaN(share) ? "" : " " + Whole(share) + " %";
+        }
+
+        public static string Rate(double bytesPerSecond)
+        {
+            double mb = bytesPerSecond / 1048576;
+            return (mb >= 10 ? Whole(mb) : (Math.Floor(mb * 10) / 10).ToString("0.0", Inv)) + " MB/s";
+        }
+
+        internal static void AddIssues(Snapshot s, double topCommit, string topCommitProc)
         {
             double v;
             const double GB = 1073741824;
@@ -521,21 +617,24 @@ namespace Kymo
             v = s.Get("mem"); if (!double.IsNaN(v) && v >= s.Lim("mem_warn")) s.Issues.Add(new Issue(Level(v, s.Lim("mem_warn"), s.Lim("mem_crit")), "Memory " + Pct(v) + " in use" + Top(s.TopMem)));
             v = s.Get("commitOfMax");
             if (!double.IsNaN(v) && v >= s.Lim("commit_warn"))
-                s.Issues.Add(new Issue(Level(v, s.Lim("commit_warn"), s.Lim("commit_crit")), "Commit " + Bytes(s.Get("committed")) + " of at most " + Bytes(s.Get("commitMax")) +
-                    (double.IsNaN(topCommit) ? "" : Top(topCommitProc + " " + Bytes(topCommit)))));
-            v = s.Get("paging5"); if (!double.IsNaN(v) && v >= s.Lim("paging_warn")) s.Issues.Add(new Issue(Level(v, s.Lim("paging_warn"), s.Lim("paging_crit")), "Heavy paging: " + Whole(v) + " pages/s read from disk"));
+                s.Issues.Add(new Issue(Level(v, s.Lim("commit_warn"), s.Lim("commit_crit")), double.IsNaN(topCommit)
+                    ? "Commit " + Bytes(s.Get("committed")) + " of at most " + Bytes(s.Get("commitMax"))
+                    : "Commit " + Bytes(s.Get("committed")) + " of " + Bytes(s.Get("commitMax")) + Top(topCommitProc + " " + Bytes(topCommit))));
+            v = s.Get("paging5"); if (!double.IsNaN(v) && v >= s.Lim("paging_warn")) s.Issues.Add(new Issue(Level(v, s.Lim("paging_warn"), s.Lim("paging_crit")), "Heavy paging: " + Whole(v) + " pages/s" + (s.TopFaults.Length > 0 ? Top(s.TopFaults) : " read from disk")));
             v = s.Get("diskFree"); if (!double.IsNaN(v) && v < s.Lim("free_warn") * GB) s.Issues.Add(new Issue(v < s.Lim("free_crit") * GB ? "crit" : "warn", s.Drive + " almost full: " + Bytes(v) + " free"));
-            v = s.Get("disk5"); if (!double.IsNaN(v) && v >= s.Lim("disk_busy")) s.Issues.Add(new Issue("warn", "Disk " + s.Drive + " busy " + Pct(v) + " for 5 min"));
+            v = s.Get("disk5"); if (!double.IsNaN(v) && v >= s.Lim("disk_busy")) s.Issues.Add(new Issue("warn", "Disk " + s.Drive + " busy " + Pct(v) + (s.TopIo.Length > 0 ? TopIo(s.TopIo) : " for 5 min")));
             double lat = Math.Max(Nz(s.Get("readLat5")), Nz(s.Get("writeLat5")));
-            if (lat >= s.Lim("latency_warn")) s.Issues.Add(new Issue(Level(lat, s.Lim("latency_warn"), s.Lim("latency_crit")), "Disk " + s.Drive + " slow, " + Whole(lat) + " ms per operation"));
-            v = s.Get("gpuTemp"); if (!double.IsNaN(v) && v >= s.Lim("gpu_temp_warn")) s.Issues.Add(new Issue(Level(v, s.Lim("gpu_temp_warn"), s.Lim("gpu_temp_crit")), "GPU hot: " + Whole(v) + " \u00b0C"));
-            v = s.Get("vram"); if (!double.IsNaN(v) && v >= s.Lim("vram_full")) s.Issues.Add(new Issue("warn", "GPU memory full: " + Pct(v)));
+            if (lat >= s.Lim("latency_warn")) s.Issues.Add(new Issue(Level(lat, s.Lim("latency_warn"), s.Lim("latency_crit")), "Disk " + s.Drive + " slow, " + Whole(lat) + " ms" + (s.TopIo.Length > 0 ? TopIo(s.TopIo) : " per operation")));
+            v = s.Get("gpuTemp"); if (!double.IsNaN(v) && v >= s.Lim("gpu_temp_warn")) s.Issues.Add(new Issue(Level(v, s.Lim("gpu_temp_warn"), s.Lim("gpu_temp_crit")), "GPU hot: " + Whole(v) + " \u00b0C" + Top(s.TopGpu)));
+            v = s.Get("vram"); if (!double.IsNaN(v) && v >= s.Lim("vram_full")) s.Issues.Add(new Issue("warn", "GPU memory full: " + Pct(v) + Top(s.TopVram)));
             v = s.Get("gpuSlow"); if (!double.IsNaN(v) && v > 0) s.Issues.Add(new Issue("warn", "GPU slowed down (thermal or hardware limit)"));
             v = s.Get("limit5"); if (!double.IsNaN(v) && v < s.Lim("perf_limit")) s.Issues.Add(new Issue("warn", "CPU held back: performance limit " + Pct(v)));
             v = s.Get("netErr5"); if (!double.IsNaN(v) && v > 0) s.Issues.Add(new Issue("warn", "Network errors on an adapter"));
         }
         static double Nz(double v) { return double.IsNaN(v) ? 0 : v; }
         static string Top(string app) { return app.Length > 0 ? " · top: " + app : ""; }
+        // An app's I/O counts files, devices and the network together, not only this disk.
+        static string TopIo(string app) { return app.Length > 0 ? " · top I/O: " + app : ""; }
     }
 
     // Draws the card into a premultiplied 32-bit bitmap (transparent around it).
@@ -845,6 +944,8 @@ namespace Kymo
         public static bool Trace, AlwaysVisible;
         protected double lastOpen = -1e9;            // Clock.Now of the last page opened by a click
         bool secondPress;                             // the button went down as the second press of a double-click
+        bool contentHeld;                             // the press went to the content (ContentPress)
+        bool leaveTracked;                            // WM_MOUSELEAVE asked for
         protected float scale = 1;
         protected Rectangle work;
         protected int width, height;
@@ -897,6 +998,13 @@ namespace Kymo
         protected abstract void Clicked(Point at, bool second);
         protected abstract void RightClicked(Point at);
         protected virtual void OnShiftWheel(int delta) { }
+        // A press the widget's content takes for itself (the process list's scroll bar): true, and the drag and the
+        // release that follow go to ContentDrag and ContentRelease; the widget neither moves nor takes it as a click.
+        protected virtual bool ContentPress(Point at) { return false; }
+        protected virtual void ContentDrag(Point at) { }
+        protected virtual void ContentRelease() { }
+        // The mouse over the widget with no button down (`inside` false: it left).
+        protected virtual void ContentHover(Point at, bool inside) { }
         protected virtual bool OnPlainWheel(int delta, Point at) { return false; }
 
         protected override CreateParams CreateParams
@@ -982,6 +1090,8 @@ namespace Kymo
         {
             Point o = Origin();
             pressed = true; dragging = resizing = moved = false; pressAt = lastAt = at;
+            contentHeld = ZoneAt(at) == 0 && ContentPress(at);
+            if (contentHeld) { zone = 0; return; }
             zone = ZoneAt(at);
             grab = new PointF(width > 0 ? (at.X - o.X) / (float)width : 0, height > 0 ? (at.Y - o.Y) / (float)height : 0);
         }
@@ -989,6 +1099,7 @@ namespace Kymo
         internal void DragTo(Point at)
         {
             if (!pressed) return;
+            if (contentHeld) { ContentDrag(at); return; }
             int slop = Px(6);
             if (!dragging && Math.Abs(at.X - pressAt.X) <= slop && Math.Abs(at.Y - pressAt.Y) <= slop) return;
             moved = true;                                // not a click any more
@@ -1135,6 +1246,7 @@ namespace Kymo
         {
             if (!pressed) return false;
             pressed = false;
+            if (contentHeld) { contentHeld = false; ContentRelease(); return true; }   // neither a move nor a click
             if (!dragging) return moved;                 // moved on a locked card: neither a move nor a click
             if (!Test) Cursor.Current = Cursors.Default;
             bool wasResizing = resizing;
@@ -1403,6 +1515,19 @@ namespace Kymo
                     Press(MessageAt()); break;
                 case 0x0200:   // WM_MOUSEMOVE; the button already up (its release went elsewhere): the drag ends there
                     if (pressed) { if ((m.WParam.ToInt64() & 1) == 0) Release(); else DragTo(MessageAt()); }   // MK_LBUTTON
+                    else
+                    {
+                        if (!leaveTracked)
+                        {
+                            var tme = new Native.TRACKMOUSEEVENT { Size = Marshal.SizeOf(typeof(Native.TRACKMOUSEEVENT)), Flags = 2, Track = Handle };   // TME_LEAVE
+                            leaveTracked = Native.TrackMouseEvent(ref tme);
+                        }
+                        ContentHover(MessageAt(), true);
+                    }
+                    break;
+                case 0x02A3:   // WM_MOUSELEAVE
+                    leaveTracked = false;
+                    ContentHover(Point.Empty, false);
                     break;
                 case 0x0202:   // WM_LBUTTONUP: the end of a drag, or a click
                     if (pressed && !Release()) Clicked(MessageAt(), secondPress);
@@ -2078,6 +2203,34 @@ namespace Kymo
             Check(one.Count == 1 && one[0].Text == "b", "one issue line: the red one");
             var parsed = Look.From(new Dictionary<string, object> { { "columns", 3 }, { "gpu", false }, { "opacity", 37 }, { "locked", true }, { "charts", "yes" } });
             Check(parsed.Columns == 3 && !parsed.Tiles[3] && parsed.Tiles[0] && parsed.Opacity == 85 && parsed.Locked && parsed.Charts, "settings read from the recorder, wrong values left at their defaults");
+
+            // The app behind an issue, where one can be named (and only those issues).
+            var busy = new Snapshot { Up = true, Look = new Look(), TopFaults = "pager 60 %", TopIo = "copier 85 MB/s", TopGpu = "game 97 %", TopVram = "game 7.5 GB" };
+            busy.V["paging5"] = 6000; busy.V["disk5"] = 95; busy.V["readLat5"] = 250; busy.V["gpuTemp"] = 85; busy.V["vram"] = 98; busy.V["diskFree"] = 5 * 1073741824.0;
+            Source.AddIssues(busy, double.NaN, "");
+            Func<string, string> issue = start => { var i = busy.Issues.FirstOrDefault(x => x.Text.StartsWith(start)); return i == null ? "(none)" : i.Text; };
+            Check(issue("Heavy paging").EndsWith("pages/s \u00b7 top: pager 60 %") && issue("Disk C: busy").EndsWith("% \u00b7 top I/O: copier 85 MB/s") && issue("Disk C: slow").EndsWith("ms \u00b7 top I/O: copier 85 MB/s")
+                && issue("GPU hot").EndsWith("top: game 97 %") && issue("GPU memory full").EndsWith("top: game 7.5 GB") && !issue("C: almost full").Contains("top"),
+                "issues name the app behind them: paging, a busy or slow disk, a hot GPU, its memory full; a full disk names none (" + issue("Heavy paging") + ")");
+            Check(Source.Rate(85 * 1048576.0) == "85 MB/s" && Source.Rate(1.27 * 1048576) == "1.2 MB/s", "I/O rates: whole MB/s from 10, else a tenth");
+            // With a long app name and big figures, each line that names an app still fits the default card's width.
+            foreach (string longName in new[] { Source.Short("StartMenuExperienceHost", 16), Source.Short("MicrosoftWindowsWWWW", 16), Source.Short("qemu-system-x86_64-headless", 16) })
+            {
+            var longest = new Snapshot { Up = true, Look = new Look(), TopFaults = longName + " 100 %", TopIo = longName + " 999 MB/s", TopGpu = longName + " 100 %", TopVram = longName + " 23.9 GB",
+                TopCpu = longName + " 100 %", TopMem = longName + " 63.9 GB" };
+            longest.V["committed"] = 99.9 * 1073741824.0; longest.V["commitMax"] = 127.9 * 1073741824.0; longest.V["commitOfMax"] = 99;
+            longest.V["paging5"] = 15000; longest.V["disk5"] = 100; longest.V["readLat5"] = 999; longest.V["gpuTemp"] = 105; longest.V["vram"] = 100; longest.V["cpu5"] = 100; longest.V["mem"] = 100;
+            Source.AddIssues(longest, 99.9 * 1073741824.0, longName);
+            float room = 470 - 2 * 18 - 18, widestPx = 0; string widestText = "";
+            using (var bmp = new Bitmap(10, 10)) using (var g = Graphics.FromImage(bmp)) using (var f = new Font("Segoe UI", 14, GraphicsUnit.Pixel))
+            using (var fmt = new StringFormat { FormatFlags = StringFormatFlags.NoWrap })
+                foreach (var i in longest.Issues.Where(x => x.Text.Contains(" top")))
+                {
+                    float wpx = g.MeasureString(i.Text, f, new SizeF(100000, 30), fmt).Width;
+                    if (wpx > widestPx) { widestPx = wpx; widestText = i.Text; }
+                }
+            Check(widestPx <= room, "every issue line with an app fits the card: the widest " + Math.Round(widestPx) + " px of " + room + " (" + widestText + ")");
+            }
 
             File.Delete(file);
             return failed;

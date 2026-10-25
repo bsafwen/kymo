@@ -2146,10 +2146,12 @@ mod tests {
                     AppRow {
                         name: "chrome".into(),
                         v: [10.0, 8.0, 2.0, 100.0, 50.0, 2e9, 3e9, 12.0, secs],
+                        faults: 0.0,
                     },
                     AppRow {
                         name: format!("app{}", m % 3),
                         v: [m as f64, 0.0, 0.0, 0.0, 0.0, 1e6, 2e6, 1.0, secs],
+                        faults: 0.0,
                     },
                 ];
                 s.write_apps(T0 + m * 60_000, &rows).unwrap();

@@ -89,8 +89,9 @@ namespace Kymo
             return new GpuEngines { query = q, counter = c };
         }
 
-        // pid -> %, and the PC's total in `total`; null before the second reading (a rate needs two).
-        public Dictionary<int, double> Read(out double total)
+        // pid -> %, and the PC's total in `total`; null before the second reading (a rate needs two). `adapter`: only
+        // that GPU's engines (its LUID, "0x00000000_0x0000D1F2"); null: every GPU.
+        public Dictionary<int, double> Read(out double total, string adapter = null)
         {
             total = double.NaN;
             if (query == IntPtr.Zero || ProcNative.PdhCollectQueryData(query) != 0) return null;
@@ -114,6 +115,7 @@ namespace Kymo
                     if ((status != 0 && status != 1) || name == null || double.IsNaN(v) || v <= 0) continue;
                     int pid; string engine;
                     if (!Parse(name, out pid, out engine)) continue;
+                    if (adapter != null && !engine.StartsWith(adapter + "|", StringComparison.Ordinal)) continue;
                     double x;
                     string key = pid.ToString(CultureInfo.InvariantCulture) + "|" + engine;
                     perType[key] = (perType.TryGetValue(key, out x) ? x : 0) + v;
@@ -142,6 +144,68 @@ namespace Kymo
             if (!int.TryParse(parts[iPid + 1], NumberStyles.Integer, CultureInfo.InvariantCulture, out pid)) return false;
             engine = parts[iLuid + 1] + "_" + parts[iLuid + 2] + "|" + parts[iPhys + 1] + "|" + string.Join("_", parts.Skip(iType + 1));
             return true;
+        }
+
+        public void Dispose() { if (query != IntPtr.Zero) { ProcNative.PdhCloseQuery(query); query = IntPtr.Zero; } }
+    }
+
+    // GPU memory per process and GPU: "\GPU Process Memory(*)\Dedicated Usage" (bytes; instances
+    // "pid_1234_luid_0x00000000_0x0000D1F2_phys_0"). Null when the counters cannot be read.
+    sealed class GpuProcessMemory : IDisposable
+    {
+        IntPtr query, counter;
+
+        public static GpuProcessMemory Open()
+        {
+            IntPtr q, c;
+            try
+            {
+                if (ProcNative.PdhOpenQuery(null, IntPtr.Zero, out q) != 0) return null;
+                if (ProcNative.PdhAddEnglishCounter(q, @"\GPU Process Memory(*)\Dedicated Usage", IntPtr.Zero, out c) != 0) { ProcNative.PdhCloseQuery(q); return null; }
+            }
+            catch (Exception e) { DeskWindow.Log("no GPU memory counters (" + e.Message + ")"); return null; }
+            return new GpuProcessMemory { query = q, counter = c };
+        }
+
+        // GPU (its LUID) -> pid -> bytes; null if they cannot be read just now.
+        public Dictionary<string, Dictionary<int, double>> ReadByAdapter()
+        {
+            if (query == IntPtr.Zero || ProcNative.PdhCollectQueryData(query) != 0) return null;
+            int size = 0, count;
+            if (ProcNative.PdhGetFormattedCounterArray(counter, ProcNative.PDH_FMT_DOUBLE | ProcNative.PDH_FMT_NOCAP100, ref size, out count, IntPtr.Zero) != ProcNative.PDH_MORE_DATA || size <= 0) return null;
+            IntPtr items = Marshal.AllocHGlobal(size);
+            try
+            {
+                if (ProcNative.PdhGetFormattedCounterArray(counter, ProcNative.PDH_FMT_DOUBLE | ProcNative.PDH_FMT_NOCAP100, ref size, out count, items) != 0) return null;
+                var byAdapter = new Dictionary<string, Dictionary<int, double>>();
+                int stride = IntPtr.Size == 8 ? 24 : 16;
+                for (int i = 0; i < count; i++)
+                {
+                    IntPtr p = items + i * stride;
+                    string name = Marshal.PtrToStringUni(Marshal.ReadIntPtr(p));
+                    int status = Marshal.ReadInt32(p, IntPtr.Size);
+                    double v = BitConverter.Int64BitsToDouble(Marshal.ReadInt64(p, IntPtr.Size == 8 ? 16 : 8));
+                    int pid; string adapter;
+                    if ((status != 0 && status != 1) || name == null || !(v > 0) || !PidOf(name, out pid, out adapter)) continue;
+                    Dictionary<int, double> byPid;
+                    if (!byAdapter.TryGetValue(adapter, out byPid)) byAdapter[adapter] = byPid = new Dictionary<int, double>();
+                    double x;
+                    byPid[pid] = (byPid.TryGetValue(pid, out x) ? x : 0) + v;
+                }
+                return byAdapter;
+            }
+            finally { Marshal.FreeHGlobal(items); }
+        }
+
+        // "pid_1234_luid_0x00000000_0x0000D1F2_phys_0": 1234 and "0x00000000_0x0000D1F2".
+        internal static bool PidOf(string name, out int pid, out string adapter)
+        {
+            pid = 0; adapter = null;
+            var parts = name.Split('_');
+            int iLuid = Array.IndexOf(parts, "luid");
+            if (parts.Length < 2 || parts[0] != "pid" || iLuid < 0 || iLuid + 2 >= parts.Length) return false;
+            adapter = parts[iLuid + 1] + "_" + parts[iLuid + 2];
+            return int.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out pid);
         }
 
         public void Dispose() { if (query != IntPtr.Zero) { ProcNative.PdhCloseQuery(query); query = IntPtr.Zero; } }
@@ -393,6 +457,9 @@ namespace Kymo
     static class ProcTable
     {
         public const float Pad = 14, TitleH = 34, HeadH = 46, RowH = 24, MadeRows = 14, NameW = 230;
+        // The scroll bar's column, right of the rows and clear of the edge the list is resized by: its thumb 6 px wide,
+        // 10 px under the mouse or held, at least 32 px tall.
+        public const float ScrollW = 14, ThumbW = 6, ThumbWide = 10, ThumbMinH = 32;
         static readonly float[] Widths = { 0, 64, 64, 100, 100, 58, 66, 74, 100 };   // per Col (Name: NameW + stretch)
         static readonly string[] Titles = { "Name", "PID", "CPU", "Memory", "I/O", "GPU", "Threads", "Handles", "Commit" };
         static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
@@ -411,7 +478,7 @@ namespace Kymo
 
         public static Size Measure(List<Col> cols, float k, double wider, double taller)
         {
-            float w = 2 * Pad + cols.Sum(c => Width(c, wider));
+            float w = 2 * Pad + cols.Sum(c => Width(c, wider)) + ScrollW;
             float h = 2 * Pad + TitleH + HeadH + MadeRows * RowH + (float)taller;
             return new Size((int)Math.Ceiling(w * k), (int)Math.Ceiling(h * k));
         }
@@ -541,10 +608,20 @@ namespace Kymo
             public readonly List<KeyValuePair<RectangleF, Col>> Titles = new List<KeyValuePair<RectangleF, Col>>();
             public readonly List<KeyValuePair<RectangleF, ProcRow>> Rows = new List<KeyValuePair<RectangleF, ProcRow>>();
             public int First, Visible, Total;   // the first row shown, how many fit, how many there are
+            public RectangleF Track, Thumb;     // the scroll bar (empty when every row fits)
         }
 
+        // The scroll bar's thumb for rows [first, first + fit) of `total`, in `track`.
+        public static RectangleF ThumbIn(RectangleF track, int first, int fit, int total, float width, float minH)
+        {
+            float h = Math.Max(Math.Min(minH, track.Height), track.Height * fit / total);
+            float y = track.Y + (track.Height - h) * first / Math.Max(1, total - fit);
+            return new RectangleF(track.X + (track.Width - width) / 2, y, width, h);
+        }
+
+        // `scroll`: the scroll bar as drawn: 0 at rest, 1 under the mouse, 2 held.
         public static Bitmap Render(ProcReading r, List<ProcRow> rows, List<Col> cols, Col sort, bool ascending, ICollection<string> open, int first,
-            float k, double wider, double taller, int opacity, double ram, Hits hits)
+            float k, double wider, double taller, int opacity, double ram, Hits hits, int scroll = 0)
         {
             Func<float, float> S = v => v * k;
             var size = Measure(cols, k, wider, taller);
@@ -553,6 +630,7 @@ namespace Kymo
             first = Math.Max(0, Math.Min(first, rows.Count - fit));
             hits.Titles.Clear(); hits.Rows.Clear();
             hits.First = first; hits.Visible = fit; hits.Total = rows.Count;
+            hits.Track = hits.Thumb = RectangleF.Empty;
             var bmp = new Bitmap(w, h, PixelFormat.Format32bppPArgb);
             using (var g = Graphics.FromImage(bmp))
             using (var fTitle = new Font("Segoe UI", S(17), FontStyle.Bold, GraphicsUnit.Pixel))
@@ -598,13 +676,13 @@ namespace Kymo
                     x += cw;
                 }
                 y += S(HeadH);
-                g.DrawLine(rule, x0, y, w - S(Pad), y);
+                g.DrawLine(rule, x0, y, w - S(Pad) - S(ScrollW), y);
 
                 // The rows.
                 for (int i = first; i < rows.Count && i < first + fit; i++)
                 {
                     var row = rows[i];
-                    var line = new RectangleF(x0, y, w - 2 * S(Pad), S(RowH));
+                    var line = new RectangleF(x0, y, w - 2 * S(Pad) - S(ScrollW), S(RowH));
                     hits.Rows.Add(new KeyValuePair<RectangleF, ProcRow>(line, row));
                     x = x0;
                     foreach (var c in cols)
@@ -628,12 +706,15 @@ namespace Kymo
                     }
                     y += S(RowH);
                 }
-                // More rows than fit: where the ones shown are among them.
+                // More rows than fit: a scroll bar in its own column, its track shown under the mouse.
                 if (rows.Count > fit)
                 {
-                    float top = S(Pad + TitleH + HeadH), span = fit * S(RowH);
-                    float barH = Math.Max(S(16), span * fit / rows.Count), barY = top + (span - barH) * first / Math.Max(1, rows.Count - fit);
-                    using (var bb = new SolidBrush(Color.FromArgb(70, 255, 255, 255))) g.FillRectangle(bb, w - S(Pad) + S(4), barY, S(3), barH);
+                    var track = new RectangleF(w - S(Pad) - S(ScrollW), S(Pad + TitleH + HeadH), S(ScrollW), fit * S(RowH));
+                    var thumb = ThumbIn(track, first, fit, rows.Count, S(scroll > 0 ? ThumbWide : ThumbW), S(ThumbMinH));
+                    hits.Track = track; hits.Thumb = thumb;
+                    if (scroll > 0) using (var tb = new SolidBrush(Color.FromArgb(28, 255, 255, 255))) using (var tp = Round(track.X + S(1), track.Y, track.Width - S(2), track.Height, (track.Width - S(2)) / 2)) g.FillPath(tb, tp);
+                    using (var bb = new SolidBrush(Color.FromArgb(scroll == 2 ? 200 : scroll == 1 ? 160 : 110, 255, 255, 255)))
+                    using (var bp = Round(thumb.X, thumb.Y, thumb.Width, thumb.Height, thumb.Width / 2)) g.FillPath(bb, bp);
                 }
             }
             return bmp;
@@ -678,6 +759,9 @@ namespace Kymo
         readonly ProcTable.Hits hits = new ProcTable.Hits();
         int first;                                    // the first row shown (scrolled)
         int scrollWheel, opacityWheel;
+        int scrollLook;                               // the scroll bar as drawn: 0 at rest, 1 under the mouse, 2 held
+        bool thumbHeld;
+        float heldY; int heldFirst;                   // where the thumb was taken, and the first row then
         double ram;
         readonly System.Windows.Forms.Timer opacitySave = new System.Windows.Forms.Timer { Interval = 1000 };
 
@@ -736,7 +820,7 @@ namespace Kymo
         protected override Bitmap Render(float k, double wider, double taller)
         {
             var rows = ProcTable.Rows(reading, look.Group, Sort, SortUp, open);
-            var bmp = ProcTable.Render(reading, rows, Columns, Sort, SortUp, open, first, k, wider, taller, Opacity2, ram, hits);
+            var bmp = ProcTable.Render(reading, rows, Columns, Sort, SortUp, open, first, k, wider, taller, Opacity2, ram, hits, scrollLook);
             first = hits.First;
             return bmp;
         }
@@ -839,6 +923,57 @@ namespace Kymo
 
         protected override void RightClicked(Point at) { Open("/#/settings?group=process-list"); }
 
+        // The scroll bar: the thumb taken and dragged; a press on the track above or below it, a page up or down.
+        PointF InList(Point at) { var o = Origin(); return new PointF(at.X - o.X, at.Y - o.Y); }
+
+        // On the scroll bar: its column, a little into the last column, and all the margin right of it up to the edge
+        // the list is resized by (presses there never reach this: the edge resizes).
+        bool OnScrollBar(PointF p)
+        {
+            return !hits.Track.IsEmpty && p.Y >= hits.Track.Top && p.Y < hits.Track.Bottom && p.X >= hits.Track.Left - 2 * scale && p.X < width;
+        }
+
+        protected override bool ContentPress(Point at)
+        {
+            var p = InList(at);
+            if (!OnScrollBar(p)) return false;
+            if (hits.Thumb.Contains(p) || (p.Y >= hits.Thumb.Top && p.Y < hits.Thumb.Bottom))
+            {
+                thumbHeld = true; heldY = p.Y; heldFirst = first;
+                scrollLook = 2;
+                Draw();
+                return true;
+            }
+            int to = Math.Max(0, Math.Min(first + (p.Y < hits.Thumb.Top ? -hits.Visible : hits.Visible), hits.Total - hits.Visible));
+            if (to != first) { first = to; Draw(); }
+            return true;
+        }
+
+        protected override void ContentDrag(Point at)
+        {
+            if (!thumbHeld) return;
+            float range = hits.Track.Height - hits.Thumb.Height;
+            int most = hits.Total - hits.Visible;
+            if (range <= 0 || most <= 0) return;
+            int to = Math.Max(0, Math.Min(most, heldFirst + (int)Math.Round((InList(at).Y - heldY) / range * most)));
+            if (to != first) { first = to; Draw(); }
+        }
+
+        protected override void ContentRelease()
+        {
+            thumbHeld = false;
+            scrollLook = 0;
+            ContentHover(MessageAt(), true);
+            Draw();
+        }
+
+        protected override void ContentHover(Point at, bool inside)
+        {
+            if (thumbHeld) return;
+            int look2 = inside && OnScrollBar(InList(at)) && ZoneAt(at) == 0 ? 1 : 0;
+            if (look2 != scrollLook) { scrollLook = look2; Draw(); }
+        }
+
         // Over the list: 3 rows a notch.
         protected override bool OnPlainWheel(int delta, Point at)
         {
@@ -889,6 +1024,7 @@ namespace Kymo
         internal ProcReading ReadOnce() { return sampler.Read(); }
         internal void ReadAsRunning() { Read(); }   // as the timer reads (ReadNow does nothing in --selftest)
         internal bool HasReading { get { return reading != null; } }
+        internal void ContentHoverAt(Point at) { ContentHover(at, at != Point.Empty); }
     }
 
     // KymoCard.exe --selftest: the process list, after the card's checks. A real reading of this PC, then made-up ones
@@ -993,6 +1129,45 @@ namespace Kymo
             Check(openedOnce && w.SortedBy == Col.Memory && w.SortedUp && Spot.Load(ProcessWindow.PlacementFile).Ascending,
                 "a double-click counts once (a program opened, a sort turned); memory smallest first is kept in its file");
             w.ClickAt(Mid(w.LastHits.Titles.First(t => t.Value == Col.Memory).Key, o));
+            hits = w.LastHits;
+
+            // The scroll bar: in a column of its own, clear of the resize edge; the thumb dragged, the track paged.
+            var track = hits.Track;
+            var thumb = hits.Thumb;
+            var trackMid = new Point(o.X + (int)(track.X + track.Width / 2), o.Y + (int)(thumb.Y + thumb.Height / 2));
+            Check(!track.IsEmpty && track.Width >= P(ProcTable.ScrollW) - 1 && thumb.Height >= P(ProcTable.ThumbMinH) - 1 && w.ZoneAt(trackMid) == 0 && w.ZoneAt(new Point(o.X + w.Bounds2.Width - 2, trackMid.Y)) != 0,
+                "a scroll bar " + track.Width + " px wide, its thumb " + thumb.Height + " px tall; the edge beside it still resizes");
+            w.ContentHoverAt(trackMid);
+            float wideThumb = w.LastHits.Thumb.Width;
+            var place = w.Bounds2;
+            w.Press(trackMid);
+            float range = track.Height - thumb.Height;
+            for (int i = 1; i <= 10; i++) w.DragTo(new Point(trackMid.X + P(30), trackMid.Y + (int)(range / 2 * i / 10)));
+            int dragged = w.FirstRow;
+            bool notClick = w.Release();
+            Check(wideThumb > thumb.Width && Math.Abs(dragged - 29 / 2.0) <= 1 && notClick && w.Bounds2 == place && w.SortedBy == Col.Memory,
+                "the thumb, wider under the mouse, dragged half way: rows from " + dragged + " of 29, the list did not move nor sort");
+            hits = w.LastHits;
+            w.Press(new Point(o.X + (int)(hits.Track.X + hits.Track.Width / 2), o.Y + (int)hits.Track.Bottom - 2));
+            w.Release();
+            Check(w.FirstRow == dragged + hits.Visible, "a press on the track under the thumb: a page down, 14 rows (" + w.FirstRow + ")");
+            w.Press(new Point(o.X + (int)(hits.Track.X + hits.Track.Width / 2), o.Y + (int)hits.Track.Top + 2));
+            w.Release();
+            w.Press(new Point(o.X + (int)(hits.Track.X + hits.Track.Width / 2), o.Y + (int)hits.Track.Top + 2));
+            w.Release();
+            Check(w.FirstRow == 0, "two presses over it: two pages up, to the top (" + w.FirstRow + ")");
+            // Right of the bar, short of the resize edge: still the scroll bar, the list does not move.
+            place = w.Bounds2;
+            var margin = new Point(o.X + place.Width - P(11), o.Y + (int)(hits.Track.Bottom - 2));
+            bool marginIsBar = w.ZoneAt(margin) == 0;
+            w.Press(margin);
+            for (int i = 1; i <= 5; i++) w.DragTo(new Point(margin.X - P(20) * i / 5, margin.Y));
+            w.Release();
+            Check(marginIsBar && w.FirstRow == hits.Visible && w.Bounds2 == place, "a press right of the bar, short of the edge: a page down, the list stays put (" + w.FirstRow + ")");
+            w.Press(new Point(o.X + (int)(hits.Track.X + hits.Track.Width / 2), o.Y + (int)hits.Track.Top + 2));
+            w.Release();
+            w.WheelOver(120);
+            w.ContentHoverAt(Point.Empty);
             hits = w.LastHits;
 
             w.WheelOver(-120);

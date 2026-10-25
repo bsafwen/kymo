@@ -71,6 +71,13 @@ It was written to replace a stack of four services (windows_exporter, nvidia_gpu
     - performance counters, disk or app readings failing;
     - GPU readings failing while the NVIDIA driver is installed;
   - in orange, for a few seconds: the recorder starting, or resuming after sleep.
+
+  **The app behind an issue**, at the end of its line ("top: ..."), where one app can be named:
+  - CPU busy: the busiest app over the same 5 minutes. Memory in use: the app using the most (private working set). Commit: the app with the most private bytes.
+  - Heavy paging: the app with the most hard page faults over 5 minutes, with its share of the PC's page reads ("top: X 60 %"). A hard fault is one read from the disk, the page file or a mapped file, of one page or a few, so it is compared with the PC's page reads, not with the pages/s figure. An app is named only when it makes at least a fifth of the reads: reads through the file cache (a big file copy, a scan) are charged to no app by Windows, and the line then names none rather than a wrong one. The recorder counts faults per app in memory only, so it names one from about a minute after it starts.
+  - Disk busy or slow: the app reading and writing the most over 5 minutes ("top I/O"), from 1 MB/s. Windows counts an app's I/O for files (cached reads included), devices and the network together, and none for paging, so it points at the likely app rather than proving it was this disk.
+  - GPU hot, or its memory full: the app busiest on the GPU (a fifth of it at least), or with the most GPU memory (256 MB at least), from the counters Task Manager uses, on the GPU the temperature and memory are about (the one with the most dedicated memory in use; an integrated GPU's apps are left out). The card reads GPU use while the GPU is warm or busy and for 5 minutes after, so the app is known when the issue shows; GPU memory while it is full.
+  - The others (a disk almost full, the CPU held back by power or heat, a GPU slowdown, network errors) have no one app behind them, and name none.
 - **The dashboards open by themselves** in your default browser after you sign in.
 - **Setup:** two tasks under your account, "Kymo desktop card" and "Kymo open dashboards". Set them up with `pwsh -File desktop\install-desktop.ps1`, without admin rights; `install.ps1` runs it too.
 - **Card log:** `%LOCALAPPDATA%\Kymo\card.log`.

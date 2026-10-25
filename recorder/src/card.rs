@@ -16,7 +16,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 
 /// The figures kept per sample, in this order (the indices below).
-pub const FIGS: [&str; 23] = [
+pub const FIGS: [&str; 24] = [
     "cpu",
     "cpu_power",
     "cpu_limit",
@@ -40,6 +40,7 @@ pub const FIGS: [&str; 23] = [
     "net_rx",
     "net_tx",
     "net_errors",
+    "page_reads",
 ];
 const N: usize = FIGS.len();
 const CPU: usize = 0;
@@ -65,6 +66,7 @@ const DISK_SIZE: usize = 19;
 const NET_RX: usize = 20;
 const NET_TX: usize = 21;
 const NET_ERRORS: usize = 22;
+const PAGE_READS: usize = 23;
 
 /// The card's last-hour lines, one point per minute.
 const HOUR: [usize; 6] = [CPU, MEM_USED, COMMITTED, GPU, DISK_ACTIVE, NET_RX];
@@ -113,6 +115,7 @@ fn figures<'a>(drive: &str, series: impl Iterator<Item = (&'a str, f64)>) -> ([f
             "mem.committed" => COMMITTED,
             "mem.commit_limit" => COMMIT_LIMIT,
             "mem.pages_in" => PAGES_IN,
+            "mem.page_reads" => PAGE_READS,
             "pagefile.size" => PAGEFILE,
             "gpu.util" => GPU,
             "gpu.temp" => GPU_TEMP,
@@ -189,8 +192,9 @@ fn figures<'a>(drive: &str, series: impl Iterator<Item = (&'a str, f64)>) -> ([f
     (f, cores)
 }
 
-/// One ended minute of apps: its end, then each app's name and values (store::APP_FIELDS).
-type AppMinute = (i64, Vec<(String, [f64; APP_N])>);
+/// One ended minute of apps: its end, then each app's name, values (store::APP_FIELDS) and hard
+/// faults per second (NaN for a minute read back from the history, which does not keep them).
+type AppMinute = (i64, Vec<(String, [f64; APP_N], f64)>);
 
 pub struct Recent {
     drive: String,
@@ -238,7 +242,7 @@ impl Recent {
                     .filter_map(|(id, v)| {
                         let mut a = [0.0; APP_N];
                         a.copy_from_slice(&v[..APP_N]);
-                        Some((names.get(*id)?.clone(), a))
+                        Some((names.get(*id)?.clone(), a, f64::NAN))
                     })
                     .collect();
                 r.push_apps(end, rows);
@@ -299,7 +303,7 @@ impl Recent {
         }
     }
 
-    fn push_apps(&mut self, end: i64, rows: Vec<(String, [f64; APP_N])>) {
+    fn push_apps(&mut self, end: i64, rows: Vec<(String, [f64; APP_N], f64)>) {
         while self.apps.back().is_some_and(|a| a.0 >= end) {
             self.apps.pop_back();
         }
@@ -320,7 +324,12 @@ impl Recent {
 
     /// A minute of apps that ended.
     pub fn apps(&mut self, end: i64, rows: &[AppRow]) {
-        self.push_apps(end, rows.iter().map(|r| (r.name.clone(), r.v)).collect());
+        self.push_apps(
+            end,
+            rows.iter()
+                .map(|r| (r.name.clone(), r.v, r.faults))
+                .collect(),
+        );
     }
 
     /// Whether any sample of the last hour has a figure (a source that answered before).
@@ -541,20 +550,50 @@ impl Recent {
     }
 
     /// The busiest app by CPU over the last 5 minutes (% of the whole CPU; time without data counts
-    /// as 0, as in /api/apps), and the biggest by memory (private working set) and by commit in the
-    /// newest minute. Left out when the newest minute of apps is not current.
+    /// as 0, as in /api/apps), the biggest by memory (private working set) and by commit in the
+    /// newest minute, and over the last 5 minutes the one reading and writing the most ("io", bytes/s
+    /// over the minutes that have apps: files, devices and network; from 1 MB/s) and the one with the most hard page faults ("faults",
+    /// per second over the minutes that counted them, which those read back from the history did not,
+    /// with "share": its % of the PC's page reads). An app is named for paging only when it makes at
+    /// least a fifth of the page reads and one a second: reads through the file cache are charged to
+    /// no app, and naming whichever app faulted a little would name the wrong one. Left out when the
+    /// newest minute of apps is not current.
     fn write_top(&self, o: &mut String, t_ref: i64) {
         key(o, "top", false);
         o.push('{');
         if let Some((end, rows)) = self.apps.back().filter(|a| a.0 > t_ref - apps_fresh_ms()) {
             let mut cpu: HashMap<&str, f64> = HashMap::new();
+            let mut io: HashMap<&str, f64> = HashMap::new();
+            let mut faults: HashMap<&str, f64> = HashMap::new();
+            let mut fault_s = 0.0; // seconds of the minutes that counted faults
+            let mut io_s = 0.0; // seconds of the minutes with apps at all (none after a start or a sleep)
             for (e, minute) in &self.apps {
                 if *e <= end - APPS_MS {
                     continue;
                 }
-                for (name, v) in minute {
-                    if v[0].is_finite() && v[APP_SECONDS].is_finite() {
-                        *cpu.entry(name.as_str()).or_default() += v[0] * v[APP_SECONDS];
+                if let Some((_, v, _)) = minute.iter().find(|(_, _, f)| f.is_finite()) {
+                    if v[APP_SECONDS].is_finite() {
+                        fault_s += v[APP_SECONDS];
+                    }
+                }
+                if let Some((_, v, _)) = minute.first() {
+                    if v[APP_SECONDS].is_finite() {
+                        io_s += v[APP_SECONDS];
+                    }
+                }
+                for (name, v, f) in minute {
+                    let secs = v[APP_SECONDS];
+                    if !secs.is_finite() {
+                        continue;
+                    }
+                    if v[0].is_finite() {
+                        *cpu.entry(name.as_str()).or_default() += v[0] * secs;
+                    }
+                    if v[3].is_finite() && v[4].is_finite() {
+                        *io.entry(name.as_str()).or_default() += (v[3] + v[4]) * secs;
+                    }
+                    if f.is_finite() {
+                        *faults.entry(name.as_str()).or_default() += f * secs;
                     }
                 }
             }
@@ -564,21 +603,36 @@ impl Recent {
                 .into_iter()
                 .max_by(|a, b| a.1.total_cmp(&b.1).then_with(|| b.0.cmp(a.0)))
                 .map(|(name, s)| (name, (s / window_s / cores).min(100.0)));
+            fn most(m: HashMap<&str, f64>, window_s: f64) -> Option<(&str, f64)> {
+                if window_s <= 0.0 {
+                    return None;
+                }
+                m.into_iter()
+                    .filter(|(_, s)| *s > 0.0)
+                    .max_by(|a, b| a.1.total_cmp(&b.1).then_with(|| b.0.cmp(a.0)))
+                    .map(|(name, s)| (name, s / window_s))
+            }
+            let top_io = most(io, io_s).filter(|(_, b)| *b >= 1_048_576.0);
+            let page_reads = self.mean(t_ref, AVG_MS).0[PAGE_READS];
+            let top_faults = most(faults, fault_s)
+                .filter(|(_, f)| *f >= 1.0 && page_reads > 0.0 && *f >= 0.2 * page_reads)
+                .map(|(name, f)| (name, f, (100.0 * f / page_reads).min(100.0)));
             let biggest = |field: usize| {
                 rows.iter()
-                    .filter(|(_, v)| v[field].is_finite())
+                    .filter(|(_, v, _)| v[field].is_finite())
                     .max_by(|a, b| {
                         a.1[field]
                             .total_cmp(&b.1[field])
                             .then_with(|| b.0.cmp(&a.0))
                     })
-                    .map(|(name, v)| (name.as_str(), v[field]))
+                    .map(|(name, v, _)| (name.as_str(), v[field]))
             };
             let mut first = true;
             for (label, best) in [
                 ("cpu", top_cpu),
                 ("mem", biggest(5)),
                 ("commit", biggest(6)),
+                ("io", top_io),
             ] {
                 let Some((name, value)) = best else { continue };
                 key(o, label, first);
@@ -588,6 +642,17 @@ impl Recent {
                 string(o, name);
                 key(o, "value", false);
                 number(o, value);
+                o.push('}');
+            }
+            if let Some((name, value, share)) = top_faults {
+                key(o, "faults", first);
+                o.push('{');
+                key(o, "name", true);
+                string(o, name);
+                key(o, "value", false);
+                number(o, value);
+                key(o, "share", false);
+                number(o, share.round());
                 o.push('}');
             }
         }
@@ -691,6 +756,7 @@ mod tests {
             (NET_RX, "net_rx"),
             (NET_TX, "net_tx"),
             (NET_ERRORS, "net_errors"),
+            (PAGE_READS, "page_reads"),
         ] {
             assert_eq!(FIGS[i], name);
         }
@@ -861,7 +927,99 @@ mod tests {
         AppRow {
             name: name.to_string(),
             v: [cpu, cpu, 0.0, 0.0, 0.0, ws, private, 1.0, 60.0],
+            faults: 0.0,
         }
+    }
+
+    #[test]
+    fn top_io_and_faults() {
+        let t0 = 1_792_454_400_000;
+        // Five minutes: "disk" reads 8 MB/s and writes 2; "pager" faults 300 times a second in
+        // four of them (the fifth: none), "quiet" does neither. The PC: `reads` page reads a second.
+        let five = |reads: f64| {
+            let mut r = Recent::new("C:".into());
+            sample_at(&mut r, t0, 1.0, 0.0, 0.0);
+            for m in 0..5 {
+                let io = AppRow {
+                    name: "disk".into(),
+                    v: [1.0, 1.0, 0.0, 8e6, 2e6, 1.0, 1.0, 1.0, 60.0],
+                    faults: 10.0,
+                };
+                let pager = AppRow {
+                    name: "pager".into(),
+                    v: [1.0, 1.0, 0.0, 1e3, 0.0, 1.0, 1.0, 1.0, 60.0],
+                    faults: if m < 4 { 300.0 } else { 0.0 },
+                };
+                r.apps(
+                    t0 + (m + 1) * 60_000,
+                    &[io, pager, row("quiet", 0.0, 1.0, 1.0)],
+                );
+            }
+            r.sample(t0 + 5 * 60_000, &[s("mem.page_reads", reads)]);
+            json(&r, t0 + 5 * 60_000 + 10_000)
+        };
+        let j = five(1000.0);
+        assert!(
+            j.contains("\"io\":{\"name\":\"disk\",\"value\":10000000}"),
+            "{j}"
+        );
+        // 4 of 5 minutes at 300: 240 a second, 24 % of the PC's 1000 page reads.
+        assert!(
+            j.contains("\"faults\":{\"name\":\"pager\",\"value\":240,\"share\":24}"),
+            "{j}"
+        );
+        // Paging mostly through the file cache (5000 reads, the apps' faults a twentieth): none named.
+        let j = five(5000.0);
+        assert!(!j.contains("\"faults\""), "{j}");
+
+        // After a start: four minutes from the history (no faults) and one counted: its rate, not a
+        // fifth of it; and an app under 1 MB/s of I/O is not named.
+        let mut h = Recent::new("C:".into());
+        sample_at(&mut h, t0, 1.0, 0.0, 0.0);
+        for m in 0..4 {
+            h.push_apps(
+                t0 + (m + 1) * 60_000,
+                vec![(
+                    "pager".into(),
+                    [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 60.0],
+                    f64::NAN,
+                )],
+            );
+        }
+        h.apps(
+            t0 + 5 * 60_000,
+            &[AppRow {
+                name: "pager".into(),
+                v: [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 60.0],
+                faults: 300.0,
+            }],
+        );
+        h.sample(t0 + 5 * 60_000, &[s("mem.page_reads", 500.0)]);
+        let j = json(&h, t0 + 5 * 60_000 + 10_000);
+        assert!(
+            j.contains("\"faults\":{\"name\":\"pager\",\"value\":300,\"share\":60}"),
+            "{j}"
+        );
+        assert!(!j.contains("\"io\""), "{j}");
+
+        // Two minutes of apps after a start: the I/O rate over those two minutes, not over five.
+        let mut fresh = Recent::new("C:".into());
+        sample_at(&mut fresh, t0, 1.0, 0.0, 0.0);
+        for m in 3..5 {
+            fresh.apps(
+                t0 + (m + 1) * 60_000,
+                &[AppRow {
+                    name: "scanner".into(),
+                    v: [0.0, 0.0, 0.0, 30e6, 0.0, 1.0, 1.0, 1.0, 60.0],
+                    faults: 0.0,
+                }],
+            );
+        }
+        let j = json(&fresh, t0 + 5 * 60_000 + 10_000);
+        assert!(
+            j.contains("\"io\":{\"name\":\"scanner\",\"value\":30000000}"),
+            "{j}"
+        );
     }
 
     #[test]

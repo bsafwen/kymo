@@ -1,5 +1,10 @@
 //! Every process, read in one call (NtQuerySystemInformation, SystemProcessInformation): CPU time,
-//! private working set, private bytes (commit) and I/O bytes. No admin rights are needed.
+//! private working set, private bytes (commit), I/O bytes and hard page faults. No admin rights are
+//! needed. Hard faults are kept for the card only (the app behind heavy paging), not in the history.
+//! A hard fault is one read from the disk, the page file or a mapped file, of one page or a cluster
+//! of them: the per-process share of \Memory\Page Reads/sec. Reads through the file cache are not
+//! charged to the process that asked for them (the cache faults on its own), so not every page read
+//! belongs to an app.
 //!
 //! History is kept per app name and minute, never per process ID (IDs churn by thousands a day).
 //! CPU and I/O are counted per process between samples and added up per name, so a process that
@@ -16,6 +21,10 @@ pub struct AppRow {
     /// cpu, user, kernel (% of one core), read, write (bytes/s), ws (private working set, bytes),
     /// private (private bytes = commit, bytes), instances, seconds of the minute with data.
     pub v: [f64; 9],
+    /// Hard page faults per second: reads from the disk, the page file or mapped files, each of one
+    /// or more pages (comparable with \Memory\Page Reads/sec, not Pages Input/sec); not kept in the
+    /// history.
+    pub faults: f64,
 }
 
 #[derive(Default)]
@@ -29,6 +38,7 @@ pub struct Totals {
 
 struct Prev {
     counters: [u64; 4], // user, kernel (100 ns), read, write (bytes)
+    faults: u32,        // hard faults (a 32-bit count: it may wrap)
     seen: u64,
 }
 
@@ -36,6 +46,7 @@ struct Minute {
     end: i64,
     covered_s: f64,
     counters: HashMap<String, [u64; 4]>,
+    faults: HashMap<String, u64>,
     memory: HashMap<(u32, i64), (String, u64, u64)>, // (pid, creation) -> name, private ws, private bytes
 }
 
@@ -45,6 +56,7 @@ impl Minute {
             end,
             covered_s: 0.0,
             counters: HashMap::new(),
+            faults: HashMap::new(),
             memory: HashMap::new(),
         }
     }
@@ -85,6 +97,7 @@ impl Minute {
                         m.2 as f64,
                         self.covered_s,
                     ],
+                    faults: self.faults.get(name).copied().unwrap_or(0) as f64 / self.covered_s,
                 }
             })
             .collect()
@@ -180,6 +193,7 @@ impl ProcSampler {
             let next: u32 = read(base, off);
             let threads: u32 = read(base, off + 0x04);
             let ws: i64 = read(base, off + 0x08);
+            let hard: u32 = read(base, off + 0x10);
             let created: i64 = read(base, off + 0x20);
             let user: i64 = read(base, off + 0x28);
             let kernel: i64 = read(base, off + 0x30);
@@ -227,27 +241,33 @@ impl ProcSampler {
                             cur[2].saturating_sub(p.counters[2]),
                             cur[3].saturating_sub(p.counters[3]),
                         ];
+                        let f = hard.wrapping_sub(p.faults) as u64;
                         p.counters = cur;
+                        p.faults = hard;
                         p.seen = gen;
-                        Some(d)
+                        Some((d, f))
                     }
                     None => {
                         self.prev.insert(
                             key,
                             Prev {
                                 counters: cur,
+                                faults: hard,
                                 seen: gen,
                             },
                         );
                         // Started since the previous sample: all of its counters belong to this interval.
-                        since.filter(|&s| created >= s).map(|_| cur)
+                        since.filter(|&s| created >= s).map(|_| (cur, hard as u64))
                     }
                 };
                 if counting && !name.is_empty() {
-                    if let Some(d) = delta {
+                    if let Some((d, f)) = delta {
                         let c = minute.counters.entry(name.clone()).or_default();
                         for k in 0..4 {
                             c[k] += d[k];
+                        }
+                        if f > 0 {
+                            *minute.faults.entry(name.clone()).or_default() += f;
                         }
                     }
                     minute
@@ -311,6 +331,7 @@ mod tests {
         let rows = p.peek();
         assert!(rows.iter().any(|r| r.v[0] > 0.0));
         assert!(rows.iter().all(|r| r.v[8] == 10.0));
+        assert!(rows.iter().all(|r| r.faults.is_finite() && r.faults >= 0.0));
         // A baseline inside the same minute keeps the minute (no second row for it).
         assert!(p.sample(1_050_000, 10.0, true).is_none());
         assert!(p.sample(1_060_000, 10.0, false).is_none());

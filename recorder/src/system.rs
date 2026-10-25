@@ -41,7 +41,7 @@ const CPU: [&str; 9] = [
     "% Performance Limit",
 ];
 
-const SINGLE: [(&str, &str, Unit); 16] = [
+const SINGLE: [(&str, &str, Unit); 17] = [
     (r"\Memory\Available Bytes", "mem.available", Unit::Bytes),
     (r"\Memory\Committed Bytes", "mem.committed", Unit::Bytes),
     (r"\Memory\Commit Limit", "mem.commit_limit", Unit::Bytes),
@@ -78,6 +78,9 @@ const SINGLE: [(&str, &str, Unit); 16] = [
     ),
     (r"\Memory\Cache Bytes", "mem.cache", Unit::Bytes),
     (r"\Memory\Pages Input/sec", "mem.pages_in", Unit::PerSec),
+    // Read operations behind Pages Input (one reads one page or a cluster of them): what the hard
+    // faults counted per app compare with, to name the app behind heavy paging.
+    (r"\Memory\Page Reads/sec", "mem.page_reads", Unit::PerSec),
     (r"\Memory\Pages Output/sec", "mem.pages_out", Unit::PerSec),
     (r"\Memory\Page Faults/sec", "mem.faults", Unit::PerSec),
     (r"\System\Processor Queue Length", "sys.queue", Unit::Count),
