@@ -20,6 +20,7 @@
 // KymoCard.exe --snapshot-processes out.png [wider=N taller=N]   render the process list (Processes.cs) to a PNG
 // KymoCard.exe --selftest <folder>  check moving the card with a second card, and the process list (exit code:
 //                                   failed checks)
+// KymoCard.exe --act <action> <pid>:<start> ...   what the process list's menu does, run as administrator (Actions.cs)
 // KymoCard.exe --trace              also log every fetch and every pause/resume
 // KymoCard.exe --trace --always-visible   fetch and draw even while covered (to check the timing)
 
@@ -1111,6 +1112,7 @@ namespace Kymo
         // once; the process list does not undo what the first click did).
         protected abstract void Clicked(Point at, bool second);
         protected abstract void RightClicked(Point at);
+        protected virtual void RightPressed(Point at) { }              // the right button down, before RightClicked
         protected virtual void OnShiftWheel(int delta) { }
         // A press the widget's content takes for itself (the process list's scroll bar): true, and the drag and the
         // release that follow go to ContentDrag and ContentRelease; the widget neither moves nor takes it as a click.
@@ -1675,6 +1677,7 @@ namespace Kymo
                     break;
                 case 0x0204:   // WM_RBUTTONDOWN (not the second press of a double right-click)
                     rightDown = !pressed;
+                    if (rightDown) RightPressed(MessageAt());
                     break;
                 case 0x0205:   // WM_RBUTTONUP: if let go on the widget
                     if (rightDown && new Rectangle(Origin(), new Size(width, height)).Contains(MessageAt())) RightClicked(MessageAt());
@@ -1715,13 +1718,18 @@ namespace Kymo
             lastOpen = Clock.Now;
             string url = Source.Base + page;
             if (Trace) Log("open " + url);
+            Start(new ProcessStartInfo(url) { UseShellExecute = true });
+        }
+
+        // A program (the browser, Explorer) started at normal priority: it would inherit this process's.
+        protected static void Start(ProcessStartInfo psi)
+        {
             try
             {
-                // The browser inherits this process's priority: open it at normal priority.
                 var me = Process.GetCurrentProcess(); var before = me.PriorityClass;
                 me.PriorityClass = ProcessPriorityClass.Normal;
-                Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
-                me.PriorityClass = before;
+                try { var p = Process.Start(psi); if (p != null) p.Dispose(); }
+                finally { me.PriorityClass = before; }
             }
             catch (Exception e) { Log("open: " + e.Message); }
         }
@@ -2361,6 +2369,9 @@ namespace Kymo
             // which a browser started from the card would inherit. 0 = ProcessMemoryPriority, 5 = MEMORY_PRIORITY_NORMAL.
             try { uint normal = 5; Native.SetProcessInformation(Native.GetCurrentProcess(), 0, ref normal, 4); } catch { }
 
+            // Started elevated by the process list's menu (Actions.cs): one action on processes, then out, with no window.
+            if (args.Length >= 1 && args[0] == "--act") return ProcActions.Act(args);
+
             if (args.Length >= 2 && args[0] == "--snapshot")
             {
                 var s = new Source().Fetch();
@@ -2410,7 +2421,7 @@ namespace Kymo
                 var w = new WidgetWindow();
                 w.Shown += (o, e) => w.BeginInvoke((MethodInvoker)delegate
                 {
-                    try { code = SelfTest.Run(w); code += ProcSelfTest.Run(w); }
+                    try { code = SelfTest.Run(w); code += ProcSelfTest.Run(w); code += ActionsSelfTest.Run(); }
                     catch (Exception ex) { WidgetWindow.Log("error: " + ex); code = 99; }
                     w.Close();
                 });

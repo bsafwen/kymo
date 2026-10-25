@@ -56,6 +56,8 @@ namespace Kymo
         public double Io;                 // bytes read and written per second (files, devices, network)
         public double Gpu = double.NaN;   // % of its busiest GPU engine; NaN when the GPU cannot be read
         public int Threads, Handles;
+        public int Parent;                // the PID of the process that started it (that one may have ended since)
+        public int BasePriority;          // its priority class's base: 4 low, 6 below normal, 8 normal, 10 above normal, 13 high, 24 realtime
     }
 
     // Every process at one reading, and the PC's totals.
@@ -295,6 +297,8 @@ namespace Kymo
                         Commit = Marshal.ReadIntPtr(p, 0xC8).ToInt64(),
                         Threads = Marshal.ReadInt32(p, 0x04),
                         Handles = Marshal.ReadInt32(p, 0x60),
+                        Parent = (int)Marshal.ReadIntPtr(p, 0x58).ToInt64(),
+                        BasePriority = Marshal.ReadInt32(p, 0x48),
                     };
                     Prev pr;
                     if (prev.TryGetValue(k, out pr))
@@ -471,6 +475,7 @@ namespace Kymo
         static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
         static readonly Color Text = Color.FromArgb(236, 239, 243), Dim = Color.FromArgb(160, 168, 180), Back = Color.FromArgb(215, 16, 19, 25);
         static readonly Color Edge = Color.FromArgb(70, 255, 255, 255), Rule = Color.FromArgb(40, 255, 255, 255), Heat = Color.FromArgb(52, 120, 220), Sorted = Color.FromArgb(34, 255, 255, 255);
+        static readonly Color Marked = Color.FromArgb(56, 255, 255, 255);
 
         public static List<Col> Shown(ProcLook look, bool gpuKnown)
         {
@@ -655,9 +660,10 @@ namespace Kymo
             return bad;
         }
 
-        // `scroll`: the scroll bar as drawn: 0 at rest, 1 under the mouse, 2 held.
+        // `scroll`: the scroll bar as drawn: 0 at rest, 1 under the mouse, 2 held. `marked`: the key of the row whose menu
+        // is open, drawn highlighted.
         public static Bitmap Render(ProcReading r, List<ProcRow> rows, List<Col> cols, Col sort, bool ascending, ICollection<string> open, int first,
-            float k, double wider, double taller, int opacity, double ram, Hits hits, int scroll = 0)
+            float k, double wider, double taller, int opacity, double ram, Hits hits, int scroll = 0, string marked = null)
         {
             Func<float, float> S = v => v * k;
             var size = Measure(cols, k, wider, taller);
@@ -727,6 +733,7 @@ namespace Kymo
                 {
                     var row = rows[i];
                     var line = new RectangleF(x0, y, w - 2 * S(Pad) - S(ScrollW), S(RowH));
+                    if (marked != null && row.Key == marked) using (var mb = new SolidBrush(Marked)) g.FillRectangle(mb, line);
                     hits.Rows.Add(new KeyValuePair<RectangleF, ProcRow>(line, row));
                     x = x0;
                     foreach (var c in cols)
@@ -789,7 +796,8 @@ namespace Kymo
     // The process list on the desktop, next to the card: shown or not, and what it shows, from the recorder's settings
     // (Settings page, Process list, carried by the card's answers); its place, size, opacity and sort its own
     // (processes-placement.txt). Click a column title to sort by it (again: the other way), a program to see its
-    // processes; scroll over it for more rows; Shift + scroll for its opacity; right-click for its settings.
+    // processes; scroll over it for more rows; Shift + scroll for its opacity; right-click a process for what can be done
+    // to it (Actions.cs), anywhere else for the list's settings.
     sealed class ProcessWindow : DeskWindow
     {
         public static string PlacementFile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Kymo\processes-placement.txt");
@@ -808,6 +816,13 @@ namespace Kymo
         float heldY; int heldFirst;                   // where the thumb was taken, and the first row then
         double ram;
         readonly System.Windows.Forms.Timer opacitySave = new System.Windows.Forms.Timer { Interval = 1000 };
+        string marked;                                // the row whose menu is open: drawn highlighted
+        ProcRow pressedRow;                           // under the mouse when the right button went down
+        bool busy;                                    // a menu, or a question after it, is open
+        readonly List<string> later = new List<string>();   // messages that came while one was open
+        NativeWindow menuOwner;                       // owns the menu and the questions after it: never shown
+        static readonly int ownPid = Process.GetCurrentProcess().Id;
+        readonly System.Windows.Forms.Timer reread = new System.Windows.Forms.Timer { Interval = 600 };   // after an action
 
         public ProcessWindow(WidgetWindow card)
         {
@@ -818,6 +833,7 @@ namespace Kymo
             var ms = new ProcNative.MEMORYSTATUSEX { Length = Marshal.SizeOf(typeof(ProcNative.MEMORYSTATUSEX)) };
             if (ProcNative.GlobalMemoryStatusEx(ref ms)) ram = ms.TotalPhys;
             opacitySave.Tick += delegate { opacitySave.Stop(); SaveSpot("opacity " + Opacity2 + " %"); };
+            reread.Tick += delegate { reread.Stop(); if (Visible) ReadNow(); };
             ReadSpot();
         }
 
@@ -864,7 +880,7 @@ namespace Kymo
         protected override Bitmap Render(float k, double wider, double taller)
         {
             var rows = ProcTable.Rows(reading, look.Group, Sort, SortUp, open);
-            var bmp = ProcTable.Render(reading, rows, Columns, Sort, SortUp, open, first, k, wider, taller, Opacity2, ram, hits, scrollLook);
+            var bmp = ProcTable.Render(reading, rows, Columns, Sort, SortUp, open, first, k, wider, taller, Opacity2, ram, hits, scrollLook, marked);
             first = hits.First;
             return bmp;
         }
@@ -965,7 +981,186 @@ namespace Kymo
                 }
         }
 
-        protected override void RightClicked(Point at) { Open("/#/settings?group=process-list"); }
+        // The row under the mouse when the right button went down: the menu is for it (the list may be sorted again
+        // before the button comes up).
+        protected override void RightPressed(Point at) { pressedRow = RowAt(at); }
+
+        ProcRow RowAt(Point at) { var p = InList(at); return hits.Rows.FirstOrDefault(r => r.Key.Contains(p)).Value; }
+
+        // On a process (or a program's row): its menu, the row highlighted while it is open. Anywhere else: the list's
+        // settings. One menu (and the questions after it) at a time; then back to the window the user was in, unless the
+        // entry opened one.
+        protected override void RightClicked(Point at)
+        {
+            // As drawn now, if it still is (a reading since holds the same processes in new objects).
+            var row = pressedRow == null ? RowAt(at) : hits.Rows.Select(r => r.Value).FirstOrDefault(r => r.Key == pressedRow.Key) ?? pressedRow;
+            pressedRow = null;
+            if (busy) return;
+            if (row == null || reading == null) { Open("/#/settings?group=process-list"); return; }
+            busy = true;
+            IntPtr before = ProcMenu.Foreground();
+            int id = 0;
+            try
+            {
+                var targets = row.Procs.Select(x => new Target(x)).ToList();
+                var tree = ProcActions.Tree(row.Procs, reading.All);
+                bool efficient = ProcActions.Efficient(targets);
+                ProcMenu.MoveOwner(MenuOwner, at);
+                marked = row.Key;
+                Draw();
+                try { id = ProcMenu.Show(MenuOwner, at, ProcMenu.For(row, tree, efficient)); }
+                finally { marked = null; Draw(); }
+                Do(id, row, tree, efficient);
+            }
+            finally
+            {
+                busy = false;
+                Flush();
+                bool whole;
+                if (id == 0 || ProcMenu.Action(id, false, out whole) != null) ProcMenu.GiveBack(MenuOwner, before);
+            }
+        }
+
+        IntPtr MenuOwner
+        {
+            get
+            {
+                if (menuOwner == null)
+                {
+                    menuOwner = new NativeWindow();
+                    menuOwner.CreateHandle(new CreateParams { Style = unchecked((int)0x80000000), ExStyle = 0x80 });   // WS_POPUP, WS_EX_TOOLWINDOW
+                }
+                return menuOwner.Handle;
+            }
+        }
+
+        // A message, after any menu or question open now.
+        void Say(string text)
+        {
+            later.Add(text);
+            if (!busy) Flush();
+        }
+
+        // The messages waiting, one after the other (one may come while another is open), then back to the window the
+        // user was in.
+        void Flush()
+        {
+            if (later.Count == 0) return;
+            IntPtr before = ProcMenu.Foreground();
+            busy = true;
+            try { while (later.Count > 0) { string text = later[0]; later.RemoveAt(0); ProcActions.Tell(MenuOwner, text); } }
+            finally { busy = false; }
+            ProcMenu.GiveBack(MenuOwner, before);
+        }
+
+        // What the chosen entry does (0: none chosen).
+        void Do(int id, ProcRow row, List<Proc> tree, bool efficient)
+        {
+            bool whole;
+            string action = ProcMenu.Action(id, efficient, out whole);
+            if (action != null)
+            {
+                var chosen = whole ? tree : row.Procs;
+                // Several processes ended at once (a program's, or a tree): asked first, as Task Manager does for a tree.
+                if (action == "end" && chosen.Count > 1 && !ProcActions.Ask(MenuOwner, EndQuestion(row, chosen, whole))) return;
+                string what = ProcMenu.Title(row) + (whole ? " and the processes " + (row.Procs.Count == 1 ? "it" : "they") + " started" : "");
+                Run(action, chosen.Select(x => new Target(x)).ToList(), what);
+                return;
+            }
+            switch (id)
+            {
+                case ProcMenu.Location: Start(new ProcessStartInfo(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe"), "/select,\"" + row.First.Path + "\"")); return;
+                case ProcMenu.Properties: ProcActions.Properties(row.First.Path); return;
+                case ProcMenu.Search:
+                    // As Task Manager: the file's name, and the program's name when it has one.
+                    string q = row.First.Image + (row.Name != row.First.Image ? " " + row.Name : "");
+                    Start(new ProcessStartInfo("https://www.bing.com/search?q=" + Uri.EscapeDataString(q)) { UseShellExecute = true });
+                    return;
+                case ProcMenu.History: Open("/#/explorer?apps=" + Uri.EscapeDataString(ProcActions.AppName(row.First.Image))); return;
+                case ProcMenu.Settings: Open("/#/settings?group=process-list"); return;
+            }
+        }
+
+        // "End the 18 processes of Code?", or "End Code (PID 1234) and the 24 processes it started?", what is lost, and a
+        // warning when some of them are parts of Windows (no file to read, or one in the Windows folder).
+        static string EndQuestion(ProcRow row, List<Proc> chosen, bool whole)
+        {
+            int n = row.Procs.Count, more = chosen.Count - n;
+            string they = n == 1 ? "it" : "they";
+            string q = whole
+                ? "End " + ProcMenu.Title(row) + " and the " + more.ToString(CultureInfo.InvariantCulture) + (more == 1 ? " process " : " processes ") + they + " started?\n\n"
+                  + "That is every program " + they + " started, and the programs those started in turn."
+                : "End the " + n.ToString(CultureInfo.InvariantCulture) + " processes of " + row.Name + "?";
+            q += "\n\nUnsaved work in them is lost.";
+            string windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows) + "\\";
+            if (chosen.Any(p => p.Path == null || p.Path.StartsWith(windows, StringComparison.OrdinalIgnoreCase)))
+                q += " Some of them are parts of Windows: ending them can make Windows misbehave until you restart the PC.";
+            return q;
+        }
+
+        // An action on processes, the list read again a moment after. What failed is said; what Windows refused is offered
+        // again as administrator. `what`: the processes as the user chose them, the first line of each message.
+        void Run(string action, List<Target> targets, string what)
+        {
+            // This program last: ending it ends the rest of the work.
+            targets = targets.OrderBy(t => t.Pid == ownPid ? 1 : 0).ToList();
+            var o = ProcActions.Do(action, targets);
+            reread.Stop(); reread.Start();
+            Log("process list: " + action + " " + what + ": " + o.Done + " done, " + o.Denied.Count + " refused, " + o.Gone + " gone, " + o.Failed + " failed, " + o.Critical + " needed by Windows");
+            int n = targets.Count;
+            var said = new List<string>();
+            if (o.Critical > 0)
+                said.Add("Kymo left " + Part(o.Critical, n) + (action == "end" ? " running" : o.Critical == 1 ? " as it was" : " as they were") + ": Windows cannot run without " + (o.Critical == 1 ? "it." : "them."));
+            if (o.Failed > 0)
+                said.Add("Kymo could not " + Verb(action) + " " + Part(o.Failed, n) + ": " + new System.ComponentModel.Win32Exception(o.LastError).Message);
+            if (said.Count > 0) Say(what + "\n\n" + string.Join("\n\n", said));
+            int d = o.Denied.Count;
+            if (d == 0) return;
+            string refusal = what + "\n\nWindows did not let Kymo " + Verb(action) + " " + Part(d, n) + ": " + (d == 1 ? "it runs" : "they run")
+                + " with more rights than Kymo has (a program run as administrator, a service, or another account's process).";
+            if (!File.Exists(ProcActions.AdminCopy))
+            {
+                Say(refusal + "\n\nKymo can do it as administrator once install.ps1 has put the copy of its program it uses for that in " + Path.GetDirectoryName(ProcActions.AdminCopy) + ".");
+                return;
+            }
+            string ask = refusal + "\n\nDo it as administrator? Windows asks for your permission next.\n\n"
+                + "If " + (d == 1 ? "it is" : "one of them is") + " a part of Windows, " + (action == "end" ? "ending it" : action.StartsWith("priority:", StringComparison.Ordinal) ? "changing its priority" : "changing its efficiency mode")
+                + " can make Windows misbehave until you restart the PC.";
+            if (!ProcActions.Ask(MenuOwner, ask)) return;
+            var denied = o.Denied.ToList();
+            ProcActions.AsAdministrator(action, denied, this, code =>
+            {
+                reread.Stop(); reread.Start();
+                Log("process list: " + action + " " + what + " as administrator: exit code " + code);
+                if (code == -1) return;   // Windows' prompt declined
+                string them = denied.Count == 1 ? "it" : "some of them";
+                var lines = new List<string>();
+                if (code == -2) lines.Add("Kymo did not finish as administrator within a minute.");
+                else if (code == -3) lines.Add("Kymo did not act as administrator: the copy of its program it uses for that (" + ProcActions.AdminCopy + ") is gone. Running install.ps1 puts it back.");
+                else if (code == -4) lines.Add("Kymo did not act as administrator: the copy of its program it uses for that (" + ProcActions.AdminCopy + ") is too old for it. Running install.ps1 updates it.");
+                else if (code < 0 || code > 7) lines.Add("Kymo could not finish as administrator (exit code " + code + ").");
+                else
+                {
+                    if ((code & 4) != 0) lines.Add("Kymo left " + (denied.Count == 1 ? "it" : "at least one of them") + (action == "end" ? " running" : " as it was") + ": Windows cannot run without it.");
+                    if ((code & 1) != 0) lines.Add("Windows did not let Kymo " + Verb(action) + " " + them + ", even as administrator: Windows protects a few processes (an antivirus, parts of Windows itself).");
+                    if ((code & 2) != 0) lines.Add("Kymo could not " + Verb(action) + " " + them + " as administrator.");
+                }
+                if (lines.Count > 0) Say(what + "\n\n" + string.Join("\n\n", lines));
+            });
+        }
+
+        static string Verb(string action)
+        {
+            return action == "end" ? "end" : action.StartsWith("priority:", StringComparison.Ordinal) ? "change the priority of" : "change the efficiency mode of";
+        }
+
+        // "it", "both", "all 18", "3 of the 18".
+        static string Part(int some, int all)
+        {
+            if (all == 1) return "it";
+            if (some == all) return all == 2 ? "both" : "all " + all.ToString(CultureInfo.InvariantCulture);
+            return some.ToString(CultureInfo.InvariantCulture) + " of the " + all.ToString(CultureInfo.InvariantCulture);
+        }
 
         // The scroll bar: the thumb taken and dragged; a press on the track above or below it, a page up or down.
         PointF InList(Point at) { var o = Origin(); return new PointF(at.X - o.X, at.Y - o.Y); }
@@ -1050,6 +1245,8 @@ namespace Kymo
         {
             if (opacitySave.Enabled) { opacitySave.Stop(); SaveSpot("opacity " + Opacity2 + " %"); }
             sampler.Dispose();
+            reread.Dispose();
+            if (menuOwner != null) menuOwner.DestroyHandle();
             base.OnFormClosed(e);
         }
 

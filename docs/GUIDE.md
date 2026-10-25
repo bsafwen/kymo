@@ -42,11 +42,18 @@ It was written to replace a stack of four services (windows_exporter, nvidia_gpu
     - **GPU:** its busiest GPU engine (3D, video, copy and so on), from the same counters as Task Manager.
     - Network and power use per process are not shown: Windows gives them only to programs running as administrator.
   - **One row per app:** the processes of one program make one row, with their count, added up. Click it to see each process under it, with its PID; click it again to fold it. Services that do not let a user read their program show under the name of their file in System32 (for example *Host Process for Windows Services*).
+  - **Right-click a process** (or an app's row, for all its processes) for what can be done to it, in Windows' own menu. Its first line names what it is for: the list keeps moving under the menu, and the menu stays with the row you pressed.
+    - **End task** ends it at once, as Task Manager does: unsaved work in it is lost. **End process tree** (shown when it started processes outside its row) ends those too: every program it started, and the programs those started in turn. For Windows Explorer, that is every program opened from the taskbar or the Start menu. Kymo asks first before it ends more than one process.
+    - **Set priority**: High, Above normal, Normal, Below normal or Low, the current one marked when all its processes share it. Realtime is not offered: it can starve the mouse, the keyboard and Windows itself. A priority lasts until the process ends.
+    - **Efficiency mode** (Windows 11), as in Task Manager: Windows runs it slower and at the lowest priority, to save power and leave the CPU to the rest. Off again, it runs at normal priority.
+    - **Open file location**, **Properties** and **Search online** (Bing, as Task Manager), and **History in Process explorer**: its history on the dashboards.
+    - The card runs with your rights, so Windows refuses some of these for a program run as administrator, a service or another account's process. Kymo then asks whether to do it as administrator, and Windows asks for permission next: its prompt names `C:\Program Files\Kymo\KymoCard.exe`, the copy of the card's program that install.ps1 puts where only administrators can change it. A process Windows cannot run without is never ended, slowed or sped up, and Windows protects a few others (an antivirus, parts of Windows) even from an administrator.
+    - A process is named by its PID and the moment it started, so a process started later with the same PID is never touched.
   - **Sort:** click a column title; again for the other way. It is sorted by memory at first, the biggest first.
   - **More rows:** scroll over it; pull its bottom edge to show more at once.
   - It is read again every 2 s by default, and only while it can be seen, like the card. It costs about a millisecond each time.
   - **Move, stretch, scale and transparency** as the card: drag it to move it; an edge stretches it (a wider name column, more rows), a corner or Ctrl + scroll scales all of it; Shift + scroll sets its opacity (its own, 85 % at first). Its place, size, opacity and sort are kept in `%LOCALAPPDATA%\Kymo\processes-placement.txt`; delete it to put the list back next to the card.
-  - **What it shows** (shown or not, its columns, one row per app, how often it is read, the lock of its place and size) is set on the Settings page, under Process list. Right-click it to go there.
+  - **What it shows** (shown or not, its columns, one row per app, how often it is read, the lock of its place and size) is set on the Settings page, under Process list. Right-click its title or column titles to go there, or choose *Process list settings* in a process's menu.
 - **What counts as an issue** (the defaults; change them on the Settings page, under Alerts; the dashboards' tiles use the same):
 
   | Check | Orange | Red |
@@ -136,6 +143,7 @@ http://127.0.0.1:21223/#/settings. Every field offers only valid values, each sh
 |---|---|
 | This repository | `install.ps1`, `uninstall.ps1`, `verify.ps1`, `test-resilience.ps1`, `desktop\` (the card, the process list and their installer), `recorder\` (the program's source and README) |
 | `C:\Program Files\Kymo\kymo.exe` | The installed program (only administrators can change it) |
+| `C:\Program Files\Kymo\KymoCard.exe` | A copy of the card's program, run as administrator for the process list's menu when Windows refuses the card's own rights |
 | `C:\ProgramData\Kymo\history\` | The history and the recorder's log (written by the service only; readable by you) |
 | `%LOCALAPPDATA%\Kymo\card.log` | The log of the desktop card and the process list |
 | `%LOCALAPPDATA%\Kymo\card-placement.txt`, `processes-placement.txt` | Where the card and the process list sit, their size (and the list's opacity and sort) |

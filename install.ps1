@@ -8,7 +8,9 @@
 
     Run it as yourself, not elevated: it builds and tests the program (recorder, Rust) as you,
     then asks once for administrator rights (UAC) to install it, then sets up the desktop card and the
-    dashboards at sign-in (desktop\install-desktop.ps1).
+    dashboards at sign-in (desktop\install-desktop.ps1). A copy of the card's program goes next to the
+    recorder, where only administrators can change it: the process list runs it for what it does as
+    administrator (its right-click menu, when Windows refuses the card's own rights).
 
     The service runs as LocalService. If a reading the recorder had before (CPU power, the GPU) is
     missing under that account, the installer moves it to LocalSystem and says so. The readings and
@@ -40,6 +42,8 @@ param(
     [switch]$Elevated,
     [string]$Exe,
     [string]$Sha,
+    [string]$Card,
+    [string]$CardSha,
     [string]$StatusFile,
     [string]$Expect
 )
@@ -51,6 +55,7 @@ $Src     = Join-Path $Here 'recorder'
 $Service = 'Kymo'
 $ProgDir = 'C:\Program Files\Kymo'
 $ExeDest = "$ProgDir\kymo.exe"
+$CardDest = "$ProgDir\KymoCard.exe"
 $PdRoot  = 'C:\ProgramData\Kymo'
 $History = "$PdRoot\history"
 $Logs    = "$PdRoot\logs"
@@ -111,9 +116,13 @@ if (-not $Elevated) {
     New-Item -ItemType Directory -Force $stage | Out-Null
     Copy-Item $built "$stage\kymo.exe" -Force
     $hash = (Get-FileHash "$stage\kymo.exe" -Algorithm SHA256).Hash
+    # The card's program, built here too: the elevated part puts it next to the recorder.
+    & (Join-Path $Here 'desktop\card\build.ps1') -Out "$stage\KymoCard.exe" | Out-Null
+    $cardHash = (Get-FileHash "$stage\KymoCard.exe" -Algorithm SHA256).Hash
     $status = "$stage\status.json"
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-Elevated',
-        '-Exe', "`"$stage\kymo.exe`"", '-Sha', $hash, '-StatusFile', "`"$status`"", '-Expect', "`"$expect`"")
+        '-Exe', "`"$stage\kymo.exe`"", '-Sha', $hash, '-Card', "`"$stage\KymoCard.exe`"", '-CardSha', $cardHash,
+        '-StatusFile', "`"$status`"", '-Expect', "`"$expect`"")
     if ($RemoveOldStack) { $argList += '-RemoveOldStack' }
     if ($Test) { $argList += '-Test' }
     Write-Host 'Asking for administrator rights to install the service...'
@@ -298,6 +307,15 @@ try {
     if ((Get-FileHash -LiteralPath "$ExeDest.new" -Algorithm SHA256).Hash -ne $Sha) { Remove-Item "$ExeDest.new" -Force; throw 'the copied program does not match the build' }
     Move-Item -LiteralPath "$ExeDest.new" -Destination $ExeDest -Force
     Ok "$ExeDest ($Sha)"
+    # The card's program for what the process list does as administrator: run from here, where only administrators
+    # can change it or add a file next to it (the card itself runs from your folder).
+    if ($Card) {
+        if ((Get-FileHash -LiteralPath $Card -Algorithm SHA256).Hash -ne $CardSha) { throw 'the staged card program does not match the hash of its build' }
+        Copy-Item -LiteralPath $Card -Destination "$CardDest.new" -Force
+        if ((Get-FileHash -LiteralPath "$CardDest.new" -Algorithm SHA256).Hash -ne $CardSha) { Remove-Item "$CardDest.new" -Force; throw 'the copied card program does not match its build' }
+        Move-Item -LiteralPath "$CardDest.new" -Destination $CardDest -Force
+        Ok "$CardDest ($CardSha)"
+    }
 
     # ------------------------------------------------------------ history
     Step 'History'
