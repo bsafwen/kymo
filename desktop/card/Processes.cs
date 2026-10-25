@@ -793,14 +793,22 @@ namespace Kymo
         // a second later. None within half a second of the last (Show desktop right after a tick): drawn again only.
         void ReadNow()
         {
-            if (Test) return;
+            if (!Test) Read();
+        }
+
+        bool primed;   // a reading taken: the next one (soon enough) has rates
+
+        void Read()
+        {
             double gap = Clock.Now - lastRead;
-            if (gap < 0.5) { Draw(); return; }
-            bool priming = reading == null || gap > 2 * look.Interval + 1;
+            if (primed && gap < 0.5) { Draw(); return; }
+            bool priming = !primed || gap > 2 * look.Interval + 1;
             var r = sampler.Read();
             fetches++;
+            if (r == null) { lastRead = Clock.Now; return; }   // not read just now: tried again at the next interval
+            primed = true;
             lastRead = priming ? Clock.Now - look.Interval + 1 : Clock.Now;
-            if (r != null && !priming) reading = r;
+            if (!priming) reading = r;
             Draw();
         }
 
@@ -879,6 +887,8 @@ namespace Kymo
         internal Spot CurrentPlace { get { return spot; } }
         internal void WheelOver(int delta) { Native.SendMessage(Handle, 0x020A, (IntPtr)(delta << 16), IntPtr.Zero); }
         internal ProcReading ReadOnce() { return sampler.Read(); }
+        internal void ReadAsRunning() { Read(); }   // as the timer reads (ReadNow does nothing in --selftest)
+        internal bool HasReading { get { return reading != null; } }
     }
 
     // KymoCard.exe --selftest: the process list, after the card's checks. A real reading of this PC, then made-up ones
@@ -916,6 +926,17 @@ namespace Kymo
                 "this process read: memory, threads, its program, CPU while busy (" + (mine == null ? "missing" : mine.Cpu.ToString("0.0", CultureInfo.InvariantCulture) + " %") + ")");
             Check(r != null && r.Cpu >= 0 && r.Cpu <= 100 && r.Memory > 0 && r.Memory < 100 && r.All.Count > 20 && !r.All.Any(x => x.Pid == 0),
                 "the PC's CPU and memory in %, every process but the idle one (" + (r == null ? 0 : r.All.Count) + " processes)");
+            // Read as it runs: the first reading only primes the rates (nothing drawn yet); the next, a second later, is
+            // shown; one right after it (within half a second) is not taken.
+            var fresh = new ProcessWindow(card);
+            fresh.ReadAsRunning();
+            bool none = !fresh.HasReading;
+            System.Threading.Thread.Sleep(1100);
+            fresh.ReadAsRunning();
+            bool shown = fresh.HasReading;
+            fresh.Dispose();
+            Check(none && shown, "read as it runs: the first reading primes, the next one is shown (" + none + ", " + shown + ")");
+
             int gpid; string engine;
             Check(GpuEngines.Parse("pid_1234_luid_0x00000000_0x0000D1F2_phys_0_eng_3_engtype_VideoDecode", out gpid, out engine) && gpid == 1234 && engine == "0x00000000_0x0000D1F2|0|VideoDecode"
                 && !GpuEngines.Parse("_Total", out gpid, out engine), "GPU engine counters read per process and engine type");
