@@ -464,13 +464,14 @@ namespace Kymo
     static class ProcTable
     {
         public const float Pad = 14, TitleH = 34, HeadH = 46, RowH = 24, MadeRows = 14, NameW = 230;
+        public const float SearchW = 170, SearchH = 24;   // the search field in the title row, narrower on a narrow list
         // The scroll bar's column, right of the rows and clear of the edge the list is resized by: its thumb 6 px wide,
         // 10 px under the mouse or held, at least 32 px tall.
         public const float ScrollW = 14, ThumbW = 6, ThumbWide = 10, ThumbMinH = 32;
         // Per Col (Name: NameW + stretch): each fits its widest text at every scale the list can be drawn at (ProcSelfTest
         // checks it), GDI rounding the fonts up the most at small ones.
         static readonly float[] Widths = { 0, 67, 70, 100, 107, 70, 80, 90, 100 };
-        const float SmallPx = 12, TotalPx = 17, RowPx = 13;   // font sizes: titles and notes, the PC's totals, rows
+        public const float SmallPx = 12, TotalPx = 17, RowPx = 13;   // font sizes: titles and notes, the PC's totals, rows
         static readonly string[] Titles = { "Name", "PID", "CPU", "Memory", "I/O", "GPU", "Threads", "Handles", "Commit" };
         static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
         static readonly Color Text = Color.FromArgb(236, 239, 243), Dim = Color.FromArgb(160, 168, 180), Back = Color.FromArgb(215, 16, 19, 25);
@@ -498,7 +499,9 @@ namespace Kymo
         public static int RowsFitting(float k, int height) { return Math.Max(1, (int)Math.Floor((height / k - 2 * Pad - TitleH - HeadH) / RowH)); }
 
         // The rows in order: programs (or processes) sorted, each open program followed by its processes.
-        public static List<ProcRow> Rows(ProcReading r, bool group, Col sort, bool ascending, ICollection<string> open)
+        // `query`: only the rows whose name or file name holds it (any case), or with a process whose PID starts with
+        // it; a program found by a PID alone is shown open, with those processes only.
+        public static List<ProcRow> Rows(ProcReading r, bool group, Col sort, bool ascending, ICollection<string> open, string query = null)
         {
             var rows = new List<ProcRow>();
             if (r == null) return rows;
@@ -513,16 +516,30 @@ namespace Kymo
                 }
             }
             else foreach (var p in r.All) { var row = One(p, false); rows.Add(row); }
+            string q = (query ?? "").Trim();
+            var byPid = new Dictionary<ProcRow, List<Proc>>();   // programs found by the PID of some of their processes
+            if (q.Length > 0)
+                rows = rows.Where(row =>
+                {
+                    if (Holds(row.Name, q) || Holds(row.First.Image, q)) return true;
+                    var found = row.Procs.Where(p => p.Pid.ToString(Inv).StartsWith(q, StringComparison.Ordinal)).ToList();
+                    if (found.Count > 0 && row.Count > 1) byPid[row] = found;
+                    return found.Count > 0;
+                }).ToList();
             var sorted = Sort(rows, sort, ascending);
             var all = new List<ProcRow>();
             foreach (var row in sorted)
             {
                 all.Add(row);
-                if (row.Count > 1 && open.Contains(row.Key))
+                List<Proc> found;
+                if (byPid.TryGetValue(row, out found)) all.AddRange(Sort(found.Select(p => One(p, true)).ToList(), sort, ascending));
+                else if (row.Count > 1 && open.Contains(row.Key))
                     all.AddRange(Sort(row.Procs.Select(p => One(p, true)).ToList(), sort, ascending));
             }
             return all;
         }
+
+        static bool Holds(string s, string q) { return s != null && s.IndexOf(q, StringComparison.OrdinalIgnoreCase) >= 0; }
 
         static ProcRow One(Proc p, bool child)
         {
@@ -622,6 +639,7 @@ namespace Kymo
             public readonly List<KeyValuePair<RectangleF, ProcRow>> Rows = new List<KeyValuePair<RectangleF, ProcRow>>();
             public int First, Visible, Total;   // the first row shown, how many fit, how many there are
             public RectangleF Track, Thumb;     // the scroll bar (empty when every row fits)
+            public RectangleF Search, SearchText, Clear;   // the search field, where its text is typed, its × (empty without a search)
         }
 
         // The scroll bar's thumb for rows [first, first + fit) of `total`, in `track`.
@@ -661,9 +679,9 @@ namespace Kymo
         }
 
         // `scroll`: the scroll bar as drawn: 0 at rest, 1 under the mouse, 2 held. `marked`: the key of the row whose menu
-        // is open, drawn highlighted.
+        // is open, drawn highlighted. `query`: the search, shown in its field (the rows are filtered by Rows).
         public static Bitmap Render(ProcReading r, List<ProcRow> rows, List<Col> cols, Col sort, bool ascending, ICollection<string> open, int first,
-            float k, double wider, double taller, int opacity, double ram, Hits hits, int scroll = 0, string marked = null)
+            float k, double wider, double taller, int opacity, double ram, Hits hits, int scroll = 0, string marked = null, string query = "")
         {
             Func<float, float> S = v => v * k;
             var size = Measure(cols, k, wider, taller);
@@ -672,7 +690,8 @@ namespace Kymo
             first = Math.Max(0, Math.Min(first, rows.Count - fit));
             hits.Titles.Clear(); hits.Rows.Clear();
             hits.First = first; hits.Visible = fit; hits.Total = rows.Count;
-            hits.Track = hits.Thumb = RectangleF.Empty;
+            hits.Track = hits.Thumb = hits.Clear = RectangleF.Empty;
+            query = query ?? "";
             var bmp = new Bitmap(w, h, PixelFormat.Format32bppPArgb);
             using (var g = Graphics.FromImage(bmp))
             using (var fTitle = new Font("Segoe UI", S(17), FontStyle.Bold, GraphicsUnit.Pixel))
@@ -693,19 +712,39 @@ namespace Kymo
                 float x0 = S(Pad), y = S(Pad);
                 // The title, and how many processes and when.
                 Ink.Draw(g, bmp, "Processes", fTitle, Text, new RectangleF(x0, y, w / 2f, S(TitleH)), left);
+                // The search field beside it: a magnifier and "Search", or the search and its ×.
+                float sx = x0 + Ink.Width("Processes", fTitle) + S(12), roomAll = w - S(Pad) - sx;
+                float sw = Math.Min(S(SearchW), Math.Max(S(90), roomAll * 0.55f));
+                var field = new RectangleF(sx, y + (S(TitleH) - S(SearchH)) / 2, sw, S(SearchH));
+                hits.Search = field;
+                hits.SearchText = new RectangleF(field.X + S(24), field.Y + S(2), field.Width - S(24) - S(query.Length > 0 ? 22 : 6), field.Height - S(4));
+                using (var fp = Round(field.X, field.Y, field.Width, field.Height, field.Height / 2))
+                {
+                    using (var fb = new SolidBrush(Color.FromArgb(query.Length > 0 ? 40 : 26, 255, 255, 255))) g.FillPath(fb, fp);
+                    if (query.Length > 0) using (var fe = new Pen(Color.FromArgb(90, 255, 255, 255), 1)) g.DrawPath(fe, fp);
+                }
+                Magnifier(g, Dim, field.X + S(12), field.Y + field.Height / 2, S(4.5f));
+                Ink.Draw(g, bmp, query.Length > 0 ? query : "Search", fSmall, query.Length > 0 ? Text : Dim, hits.SearchText, left);
+                if (query.Length > 0)
+                {
+                    hits.Clear = new RectangleF(field.Right - S(22), field.Y, S(22), field.Height);
+                    Cross(g, Dim, hits.Clear.X + hits.Clear.Width / 2 - S(2), field.Y + field.Height / 2, S(3.5f));
+                }
                 if (r != null)
                 {
-                    // How many, the memory held compressed and when, beside the title: the longest of these that fits,
-                    // without the compressed memory first, then without the count, so that the time stays whole.
-                    float from = x0 + Ink.Width("Processes", fTitle) + S(12), room = w - S(Pad) - from;
-                    string count = r.All.Count.ToString("#,0", Inv) + " processes", time = r.At.ToString("HH:mm:ss", Inv), when = "updated " + time;
+                    // How many (found, with a search), the memory held compressed and when, beside the field: the longest
+                    // of these that fits, without the compressed memory first, then without the count; nothing if even
+                    // the time does not fit.
+                    float from = field.Right + S(12), room = w - S(Pad) - from;
+                    int found = rows.Where(rw => !rw.Child).Sum(rw => rw.Procs.Count);
+                    string count = (query.Length > 0 ? found.ToString("#,0", Inv) + " of " : "") + r.All.Count.ToString("#,0", Inv) + " processes", time = r.At.ToString("HH:mm:ss", Inv), when = "updated " + time;
                     string held = r.Compressed >= 1073741824 ? (r.Compressed / 1073741824).ToString("0.0", Inv) + " GB compressed"
                         : r.Compressed >= 1048576 ? Math.Round(r.Compressed / 1048576).ToString("0", Inv) + " MB compressed" : "";
                     var lines = new List<string>();
                     if (held.Length > 0) lines.Add(count + "  \u00b7  " + held + "  \u00b7  " + when);
                     lines.Add(count + "  \u00b7  " + when); lines.Add(when); lines.Add(time);
-                    string line = lines.FirstOrDefault(l => Ink.Width(l, fSmall) <= room) ?? time;
-                    Ink.Draw(g, bmp, line, fSmall, Dim, new RectangleF(from, y, room, S(TitleH)), right);
+                    string line = lines.FirstOrDefault(l => Ink.Width(l, fSmall) <= room);
+                    if (line != null) Ink.Draw(g, bmp, line, fSmall, Dim, new RectangleF(from, y, room, S(TitleH)), right);
                 }
                 y += S(TitleH);
 
@@ -757,6 +796,8 @@ namespace Kymo
                     }
                     y += S(RowH);
                 }
+                if (rows.Count == 0 && query.Length > 0)
+                    Ink.Draw(g, bmp, "No process matches \u201c" + query + "\u201d", fRow, Dim, new RectangleF(x0 + S(18), y, w - 2 * S(Pad) - S(18), S(RowH)), left);
                 // More rows than fit: a scroll bar in its own column, its track shown under the mouse.
                 if (rows.Count > fit)
                 {
@@ -778,6 +819,24 @@ namespace Kymo
                                     : new[] { new PointF(cx - s, cy - s / 2), new PointF(cx + s, cy - s / 2), new PointF(cx, cy + s / 2) });
         }
 
+        static void Magnifier(Graphics g, Color c, float cx, float cy, float r)
+        {
+            using (var pen = new Pen(c, Math.Max(1f, r / 3)) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+            {
+                g.DrawEllipse(pen, cx - r - r / 4, cy - r - r / 4, 2 * r, 2 * r);
+                g.DrawLine(pen, cx + r * 0.45f, cy + r * 0.45f, cx + r * 1.15f, cy + r * 1.15f);
+            }
+        }
+
+        static void Cross(Graphics g, Color c, float cx, float cy, float s)
+        {
+            using (var pen = new Pen(c, Math.Max(1f, s / 2.5f)) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+            {
+                g.DrawLine(pen, cx - s, cy - s, cx + s, cy + s);
+                g.DrawLine(pen, cx - s, cy + s, cx + s, cy - s);
+            }
+        }
+
         static void Chevron(Graphics g, Color c, float x, float cy, float s, bool open)
         {
             using (var pen = new Pen(c, Math.Max(1f, s / 3)) { StartCap = LineCap.Round, EndCap = LineCap.Round })
@@ -793,11 +852,68 @@ namespace Kymo
         }
     }
 
+    // The list's search, while typed in: a small window with a text box over the search field drawn on the list (the
+    // list itself never takes the keyboard: it stays under the windows in use). Typing searches at once; Enter or a click
+    // elsewhere closes it and keeps the search; Escape clears it.
+    sealed class SearchBox : Form
+    {
+        readonly TextBox box;
+        readonly Action<string> changed;
+        Font font;
+
+        public SearchBox(Action<string> changed)
+        {
+            this.changed = changed;
+            AutoScaleMode = AutoScaleMode.None;
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.Manual;
+            BackColor = Color.FromArgb(41, 44, 50);   // the field as drawn over the list's background
+            box = new TextBox { BorderStyle = BorderStyle.None, BackColor = BackColor, ForeColor = Color.FromArgb(236, 239, 243) };
+            Controls.Add(box);
+            box.TextChanged += delegate { changed(box.Text); };
+            box.KeyDown += (o, e) =>
+            {
+                if (e.KeyCode == Keys.Escape) { box.Text = ""; Hide(); e.SuppressKeyPress = true; }
+                else if (e.KeyCode == Keys.Enter) { Hide(); e.SuppressKeyPress = true; }
+            };
+            Deactivate += delegate { Hide(); };
+        }
+
+        protected override CreateParams CreateParams
+        {
+            get { var cp = base.CreateParams; cp.ExStyle |= 0x80; return cp; }   // WS_EX_TOOLWINDOW: not in Alt+Tab
+        }
+
+        // Over `at` (screen px), its text `px` pixels high, the search in it, with the keyboard.
+        public void Open(Rectangle at, float px, string text)
+        {
+            if (font == null || Math.Abs(font.Size - px) > 0.01) { if (font != null) font.Dispose(); font = new Font("Segoe UI", px, GraphicsUnit.Pixel); box.Font = font; }
+            Bounds = at;
+            box.SetBounds(0, Math.Max(0, (at.Height - box.PreferredHeight) / 2), at.Width, box.PreferredHeight);
+            box.Text = text;
+            box.SelectionStart = text.Length;
+            Show();
+            Activate();
+            box.Focus();
+        }
+
+        // For --selftest: typed, or a key pressed.
+        internal void Type(string text) { box.Text = text; }
+        internal void Key(Keys k) { box.Text = k == Keys.Escape ? "" : box.Text; Hide(); }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && font != null) font.Dispose();
+            base.Dispose(disposing);
+        }
+    }
+
     // The process list on the desktop, next to the card: shown or not, and what it shows, from the recorder's settings
     // (Settings page, Process list, carried by the card's answers); its place, size, opacity and sort its own
     // (processes-placement.txt). Click a column title to sort by it (again: the other way), a program to see its
-    // processes; scroll over it for more rows; Shift + scroll for its opacity; right-click a process for what can be done
-    // to it (Actions.cs), anywhere else for the list's settings.
+    // processes; click its search field to find processes; scroll over it for more rows; Shift + scroll for its opacity;
+    // right-click a process for what can be done to it (Actions.cs), anywhere else for the list's settings.
     sealed class ProcessWindow : DeskWindow
     {
         public static string PlacementFile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Kymo\processes-placement.txt");
@@ -817,6 +933,8 @@ namespace Kymo
         double ram;
         readonly System.Windows.Forms.Timer opacitySave = new System.Windows.Forms.Timer { Interval = 1000 };
         string marked;                                // the row whose menu is open: drawn highlighted
+        string query = "";                            // the search: only the processes it finds are listed
+        SearchBox searchBox;                          // where the search is typed, over its field (while typed in)
         ProcRow pressedRow;                           // under the mouse when the right button went down
         bool busy;                                    // a menu, or a question after it, is open
         readonly List<string> later = new List<string>();   // messages that came while one was open
@@ -879,9 +997,10 @@ namespace Kymo
 
         protected override Bitmap Render(float k, double wider, double taller)
         {
-            var rows = ProcTable.Rows(reading, look.Group, Sort, SortUp, open);
-            var bmp = ProcTable.Render(reading, rows, Columns, Sort, SortUp, open, first, k, wider, taller, Opacity2, ram, hits, scrollLook, marked);
+            var rows = ProcTable.Rows(reading, look.Group, Sort, SortUp, open, query);
+            var bmp = ProcTable.Render(reading, rows, Columns, Sort, SortUp, open, first, k, wider, taller, Opacity2, ram, hits, scrollLook, marked, query);
             first = hits.First;
+            if (searchBox != null && searchBox.Visible) searchBox.Bounds = OnScreen(hits.SearchText);   // the list moved or grew
             return bmp;
         }
 
@@ -961,6 +1080,8 @@ namespace Kymo
             if (second) return;   // a double-click: one click (the second would undo the first)
             var o = Origin();
             var p = new PointF(at.X - o.X, at.Y - o.Y);
+            if (hits.Clear.Contains(p)) { Find(""); return; }
+            if (hits.Search.Contains(p)) { OpenSearch(); return; }
             foreach (var t in hits.Titles)
                 if (t.Key.Contains(p))
                 {
@@ -1241,8 +1362,32 @@ namespace Kymo
             opacitySave.Stop(); opacitySave.Start();
         }
 
+        // The search field typed in: a small window over it, with the keyboard (the list never takes it).
+        void OpenSearch()
+        {
+            if (searchBox == null) searchBox = new SearchBox(Find);
+            searchBox.Open(OnScreen(hits.SearchText), ProcTable.SmallPx * scale, query);
+        }
+
+        Rectangle OnScreen(RectangleF r)
+        {
+            var o = Origin();
+            return new Rectangle(o.X + (int)Math.Round(r.X), o.Y + (int)Math.Round(r.Y), (int)Math.Round(r.Width), (int)Math.Round(r.Height));
+        }
+
+        // A new search: from the first row, drawn at once.
+        void Find(string q)
+        {
+            q = q ?? "";
+            if (q == query) return;
+            query = q;
+            first = 0;
+            Draw();
+        }
+
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
+            if (searchBox != null) searchBox.Dispose();
             if (opacitySave.Enabled) { opacitySave.Stop(); SaveSpot("opacity " + Opacity2 + " %"); }
             sampler.Dispose();
             reread.Dispose();
@@ -1260,6 +1405,9 @@ namespace Kymo
         internal int FirstRow { get { return first; } }
         internal bool Hidden { get { return hiddenBySetting; } }
         internal void ClickAt(Point at, bool second = false) { Clicked(at, second); }
+        internal string Query { get { return query; } }
+        internal SearchBox Search { get { return searchBox; } }
+        internal void FindForTest(string q) { Find(q); }
         internal Spot CurrentPlace { get { return spot; } }
         internal void WheelOver(int delta) { Native.SendMessage(Handle, 0x020A, (IntPtr)(delta << 16), IntPtr.Zero); }
         internal ProcReading ReadOnce() { return sampler.Read(); }
@@ -1345,6 +1493,43 @@ namespace Kymo
             Check(w.SortedBy == Col.Memory && !w.SortedUp && row(0).Name == "big.exe" && row(1).Name == "app.exe" && row(1).Count == 3 && Math.Abs(row(1).Memory - 600 * 1048576.0) < 1,
                 "sorted by memory, biggest first; a program's processes in one row, added up (" + row(0).Name + ", " + row(1).Name + " x" + row(1).Count + ")");
             Check(hits.Visible == (int)ProcTable.MadeRows && hits.Rows.Count == hits.Visible && hits.Total == 43, "as made: 14 rows shown of 43 (" + hits.Rows.Count + ")");
+
+            // A search: by name (any case), by the start of a PID; a program found by a PID shown open with that process
+            // only; nothing found; cleared.
+            w.FindForTest("APP");
+            int byName = w.LastHits.Total;
+            w.FindForTest("200");
+            hits = w.LastHits;
+            bool bigByPid = hits.Total == 1 && row(0).Name == "big.exe";
+            w.FindForTest("102");
+            hits = w.LastHits;
+            var rowsNow = hits.Rows.Select(x => x.Value).ToList();
+            int appAt = rowsNow.FindIndex(x => x.Name == "app.exe" && !x.Child);
+            bool openOnIt = appAt >= 0 && appAt + 1 < rowsNow.Count && rowsNow[appAt + 1].Child && rowsNow[appAt + 1].First.Pid == 102
+                && rowsNow.Count(x => x.Child) == 1 && hits.Total == 12;   // and small20 to small29: PIDs 1020 to 1029
+            w.FindForTest("no such process");
+            int nothing = w.LastHits.Total;
+            bool clearShown = !w.LastHits.Clear.IsEmpty;
+            w.FindForTest("");
+            hits = w.LastHits;
+            Check(byName == 1 && bigByPid && openOnIt && nothing == 0 && clearShown && hits.Total == 43 && hits.Clear.IsEmpty && !hits.Search.IsEmpty,
+                "search: by name in any case (" + byName + "), by a PID's start, a program open on the process found, nothing found, cleared (" + hits.Total + ")");
+
+            // Its field clicked: a box over it, typed in, searching at once; Escape clears it. The × clears a search.
+            IntPtr fg = Native.GetForegroundWindow();
+            w.ClickAt(Mid(hits.Search, o));
+            bool boxShown = w.Search != null && w.Search.Visible;
+            if (boxShown) w.Search.Type("busy");
+            int typed = w.LastHits.Total;
+            string q1 = w.Query;
+            if (boxShown) w.Search.Key(Keys.Escape);
+            bool escaped = w.Query == "" && (w.Search == null || !w.Search.Visible);
+            w.FindForTest("big");
+            w.ClickAt(Mid(w.LastHits.Clear, o));
+            bool crossed = w.Query == "" && w.LastHits.Total == 43;
+            if (fg != IntPtr.Zero) Native.SetForegroundWindow(fg);
+            hits = w.LastHits;
+            Check(boxShown && typed == 1 && q1 == "busy" && escaped && crossed, "search field clicked: a box to type in, searching as typed; Escape and the \u00d7 clear it");
 
             var cpuTitle = hits.Titles.First(t => t.Value == Col.Cpu).Key;
             w.ClickAt(Mid(cpuTitle, o));

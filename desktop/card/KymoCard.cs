@@ -17,7 +17,7 @@
 // KymoCard.exe --snapshot out.png [key=value ...]   render one card to a PNG and exit (for checks), with
 //                                   settings to try (as in /api/card "card": columns=3 charts=false;
 //                                   wider=120 taller=60 for a card stretched by its edges)
-// KymoCard.exe --snapshot-processes out.png [wider=N taller=N]   render the process list (Processes.cs) to a PNG
+// KymoCard.exe --snapshot-processes out.png [wider=N taller=N search=text]   render the process list (Processes.cs) to a PNG
 // KymoCard.exe --selftest <folder>  check moving the card with a second card, and the process list (exit code:
 //                                   failed checks)
 // KymoCard.exe --act <action> <pid>:<start> ...   what the process list's menu does, run as administrator (Actions.cs)
@@ -85,6 +85,7 @@ namespace Kymo
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(string cls, string title);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
         [DllImport("user32.dll")] public static extern IntPtr MonitorFromPoint(POINT pt, uint flags);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool GetMonitorInfo(IntPtr mon, ref MONITORINFO info);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool GetMonitorInfo(IntPtr mon, ref MONITORINFOEX info);
@@ -2395,10 +2396,12 @@ namespace Kymo
                     var r = sampler.Read();
                     var procLook = ProcLook.From(pairs, "");
                     var cols = ProcTable.Shown(procLook, !double.IsNaN(r.Gpu));
-                    var rows = ProcTable.Rows(r, procLook.Group, Col.Memory, false, new HashSet<string>());
+                    // search=text: the list searched for it.
+                    string q = pairs.ContainsKey("search") ? Convert.ToString(pairs["search"], CultureInfo.InvariantCulture) : "";
+                    var rows = ProcTable.Rows(r, procLook.Group, Col.Memory, false, new HashSet<string>(), q);
                     var ms = new ProcNative.MEMORYSTATUSEX { Length = Marshal.SizeOf(typeof(ProcNative.MEMORYSTATUSEX)) };
                     ProcNative.GlobalMemoryStatusEx(ref ms);
-                    using (var bmp = ProcTable.Render(r, rows, cols, Col.Memory, false, new HashSet<string>(), 0, 1.5f, room("wider"), room("taller"), 85, ms.TotalPhys, new ProcTable.Hits()))
+                    using (var bmp = ProcTable.Render(r, rows, cols, Col.Memory, false, new HashSet<string>(), 0, 1.5f, room("wider"), room("taller"), 85, ms.TotalPhys, new ProcTable.Hits(), 0, null, q))
                         bmp.Save(args[1], ImageFormat.Png);
                 }
                 return 0;
