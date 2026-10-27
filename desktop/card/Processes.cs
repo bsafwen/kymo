@@ -872,11 +872,7 @@ namespace Kymo
             box = new TextBox { BorderStyle = BorderStyle.None, BackColor = BackColor, ForeColor = Color.FromArgb(236, 239, 243) };
             Controls.Add(box);
             box.TextChanged += delegate { changed(box.Text); };
-            box.KeyDown += (o, e) =>
-            {
-                if (e.KeyCode == Keys.Escape) { box.Text = ""; Hide(); e.SuppressKeyPress = true; }
-                else if (e.KeyCode == Keys.Enter) { Hide(); e.SuppressKeyPress = true; }
-            };
+            box.KeyDown += (o, e) => { if (HandleKey(e.KeyData)) e.Handled = e.SuppressKeyPress = true; };
             Deactivate += delegate { Hide(); };
         }
 
@@ -898,9 +894,54 @@ namespace Kymo
             box.Focus();
         }
 
-        // For --selftest: typed, or a key pressed.
+        // The keys a text box should know and this one (a single-line WinForms box) does not: Ctrl+A selects all,
+        // Ctrl+Backspace and Ctrl+Delete delete a word (it would type a box for the first); Escape clears the search and
+        // closes, Enter closes. Copy, cut, paste, undo and the arrows with Ctrl and Shift work as they are.
+        bool HandleKey(Keys keys)
+        {
+            switch (keys)
+            {
+                case Keys.Escape: box.Text = ""; Hide(); return true;
+                case Keys.Enter: Hide(); return true;
+                case Keys.Control | Keys.A: box.SelectAll(); return true;
+                case Keys.Control | Keys.Back: DeleteWord(false); return true;
+                case Keys.Control | Keys.Delete: DeleteWord(true); return true;
+            }
+            return false;
+        }
+
+        // The selection; else the word before the caret with the spaces after it, or the word after it with the spaces
+        // that follow, as elsewhere in Windows.
+        void DeleteWord(bool forward)
+        {
+            string t = box.Text;
+            int at = box.SelectionStart, n = box.SelectionLength;
+            if (n == 0)
+            {
+                int i = at;
+                if (forward)
+                {
+                    while (i < t.Length && !char.IsWhiteSpace(t[i])) i++;
+                    while (i < t.Length && char.IsWhiteSpace(t[i])) i++;
+                    n = i - at;
+                }
+                else
+                {
+                    while (i > 0 && char.IsWhiteSpace(t[i - 1])) i--;
+                    while (i > 0 && !char.IsWhiteSpace(t[i - 1])) i--;
+                    n = at - i; at = i;
+                }
+            }
+            if (n == 0) return;
+            box.Text = t.Remove(at, n);
+            box.SelectionStart = at;
+        }
+
+        // For --selftest: typed, the caret placed, a key pressed (as KeyDown gets it), the whole text selected.
         internal void Type(string text) { box.Text = text; }
-        internal void Key(Keys k) { box.Text = k == Keys.Escape ? "" : box.Text; Hide(); }
+        internal void Caret(int at) { box.Select(at, 0); }
+        internal bool Key(Keys keys) { return HandleKey(keys); }
+        internal bool AllSelected { get { return box.TextLength > 0 && box.SelectionStart == 0 && box.SelectionLength == box.TextLength; } }
 
         protected override void Dispose(bool disposing)
         {
@@ -1519,7 +1560,17 @@ namespace Kymo
             IntPtr fg = Native.GetForegroundWindow();
             w.ClickAt(Mid(hits.Search, o));
             bool boxShown = w.Search != null && w.Search.Visible;
-            if (boxShown) w.Search.Type("busy");
+            // Its keys: Ctrl+A selects all; Ctrl+Backspace and Ctrl+Delete delete a word.
+            string wordBack = null, wordOn = null; bool all = false;
+            if (boxShown)
+            {
+                w.Search.Type("big busy");
+                w.Search.Caret(8); w.Search.Key(Keys.Control | Keys.Back); wordBack = w.Query;
+                w.Search.Type("big busy");
+                w.Search.Caret(0); w.Search.Key(Keys.Control | Keys.Delete); wordOn = w.Query;
+                w.Search.Key(Keys.Control | Keys.A); all = w.Search.AllSelected;
+                w.Search.Type("busy");
+            }
             int typed = w.LastHits.Total;
             string q1 = w.Query;
             if (boxShown) w.Search.Key(Keys.Escape);
@@ -1530,6 +1581,7 @@ namespace Kymo
             if (fg != IntPtr.Zero) Native.SetForegroundWindow(fg);
             hits = w.LastHits;
             Check(boxShown && typed == 1 && q1 == "busy" && escaped && crossed, "search field clicked: a box to type in, searching as typed; Escape and the \u00d7 clear it");
+            Check(wordBack == "big " && wordOn == "busy" && all, "search keys: Ctrl+Backspace and Ctrl+Delete delete a word (\"" + wordBack + "\", \"" + wordOn + "\"), Ctrl+A selects all");
 
             var cpuTitle = hits.Titles.First(t => t.Value == Col.Cpu).Key;
             w.ClickAt(Mid(cpuTitle, o));
