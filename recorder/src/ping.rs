@@ -298,12 +298,13 @@ fn pinger(main: bool) {
         log!("ping: ICMP is not available");
         return;
     }
-    let mut gateway_at = i64::MIN;
+    let mut gateway_at: Option<i64> = None; // win::tick_ms of the last lookup
     loop {
         let started = Instant::now();
         // The router, looked up again each minute (another network, a VPN).
-        if !main && crate::win::tick_ms() - gateway_at > 60_000 {
-            gateway_at = crate::win::tick_ms();
+        let tick = crate::win::tick_ms();
+        if !main && gateway_at.map_or(true, |t| tick - t > 60_000) {
+            gateway_at = Some(tick);
             let g = gateway();
             let mut s = lock();
             if s.gateway != g {
@@ -479,7 +480,9 @@ mod tests {
     #[test]
     #[ignore] // sends real pings (to this PC): cargo test -- --ignored
     fn the_threads_ping_and_report() {
-        configure(Some(("here".into(), "127.0.0.1".into())), false);
+        // With the router too, where this PC has one (the router's thread looks it up at once).
+        let has_router = gateway().is_some();
+        configure(Some(("here".into(), "127.0.0.1".into())), true);
         std::thread::sleep(Duration::from_millis(3500));
         let mut out = Vec::new();
         push_samples(&mut out);
@@ -490,6 +493,11 @@ mod tests {
             get("ping.rtt")
         );
         assert_eq!(get("ping.loss"), Some(0.0));
+        assert!(
+            !has_router || get("ping.router_loss").is_some(),
+            "router: {:?}",
+            get("ping.router_loss")
+        );
         let mut o = String::from("{\"x\":0");
         write_card(&mut o, 5, "example.com");
         assert!(o.contains("\"ping\":{\"on\":true,\"choice\":5,\"answered\":true,\"label\":\"here\",\"host\":\"127.0.0.1\",\"address\":\"127.0.0.1\""), "{o}");
