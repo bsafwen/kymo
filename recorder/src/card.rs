@@ -16,7 +16,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 
 /// The figures kept per sample, in this order (the indices below).
-pub const FIGS: [&str; 24] = [
+pub const FIGS: [&str; 29] = [
     "cpu",
     "cpu_power",
     "cpu_limit",
@@ -41,6 +41,11 @@ pub const FIGS: [&str; 24] = [
     "net_tx",
     "net_errors",
     "page_reads",
+    "ping_ms",
+    "ping_loss",
+    "ping_jitter",
+    "router_ms",
+    "router_loss",
 ];
 const N: usize = FIGS.len();
 const CPU: usize = 0;
@@ -67,9 +72,24 @@ const NET_RX: usize = 20;
 const NET_TX: usize = 21;
 const NET_ERRORS: usize = 22;
 const PAGE_READS: usize = 23;
+const PING_MS: usize = 24;
+const PING_LOSS: usize = 25;
+const PING_JITTER: usize = 26;
+const ROUTER_MS: usize = 27;
+const ROUTER_LOSS: usize = 28;
 
 /// The card's last-hour lines, one point per minute.
-const HOUR: [usize; 6] = [CPU, MEM_USED, COMMITTED, GPU, DISK_ACTIVE, NET_RX];
+const HOUR: [usize; 9] = [
+    CPU,
+    MEM_USED,
+    COMMITTED,
+    GPU,
+    DISK_ACTIVE,
+    NET_RX,
+    PING_MS,
+    PING_LOSS,
+    ROUTER_MS,
+];
 /// "now": the last 30 s, or the last sample at intervals longer than that.
 fn now_ms() -> i64 {
     crate::interval_ms().max(30_000)
@@ -125,6 +145,21 @@ fn figures<'a>(drive: &str, series: impl Iterator<Item = (&'a str, f64)>) -> ([f
             "net.tx_bps" => NET_TX,
             // Every adapter's errors per second (recorded whether adapters are or not).
             "net.errors" => NET_ERRORS,
+            // Round trips in s in the history, ms on the card.
+            "ping.rtt" => {
+                f[PING_MS] = 1000.0 * v;
+                continue;
+            }
+            "ping.jitter" => {
+                f[PING_JITTER] = 1000.0 * v;
+                continue;
+            }
+            "ping.router_rtt" => {
+                f[ROUTER_MS] = 1000.0 * v;
+                continue;
+            }
+            "ping.loss" => PING_LOSS,
+            "ping.router_loss" => ROUTER_LOSS,
             "mem.available" => {
                 available = v;
                 continue;
@@ -204,6 +239,9 @@ pub struct Recent {
     apps: VecDeque<AppMinute>,
     /// Logical processors (app CPU is stored as a % of one of them).
     cores: usize,
+    /// When the address pinged last changed (wall ms, 0: not in this run): the ping's figures of
+    /// the samples before are another address's, left out.
+    pub ping_since: i64,
 }
 
 impl Default for Recent {
@@ -219,6 +257,7 @@ impl Recent {
             points: VecDeque::new(),
             apps: VecDeque::new(),
             cores: 0,
+            ping_since: 0,
         }
     }
 
@@ -334,6 +373,11 @@ impl Recent {
         );
     }
 
+    /// Whether figure `i` of the sample at `t` is a ping of the address before the last change.
+    fn old_ping(&self, t: i64, i: usize) -> bool {
+        matches!(i, PING_MS | PING_LOSS | PING_JITTER) && t <= self.ping_since
+    }
+
     /// Whether any sample of the last hour has a figure (a source that answered before).
     fn seen(&self, i: usize) -> bool {
         self.points.iter().any(|p| p.1[i].is_finite())
@@ -440,7 +484,7 @@ impl Recent {
                 break;
             }
             for i in 0..N {
-                if f[i].is_finite() {
+                if f[i].is_finite() && !self.old_ping(*t, i) {
                     sum[i] += f[i];
                     n[i] += 1;
                 }
@@ -517,7 +561,7 @@ impl Recent {
             }
             let b = ((t - start - 1) / 60_000) as usize;
             for (j, &i) in HOUR.iter().enumerate() {
-                if f[i].is_finite() {
+                if f[i].is_finite() && !self.old_ping(*t, i) {
                     sum[j][b] += f[i];
                     n[j][b] += 1;
                 }
@@ -541,6 +585,20 @@ impl Recent {
                 })
                 .collect();
             numbers(o, &v);
+        }
+        // The ping's best and worst sample of the hour.
+        let pings: Vec<f64> = self
+            .points
+            .iter()
+            .filter(|p| p.0 > start && p.0 <= end && !self.old_ping(p.0, PING_MS))
+            .map(|p| p.1[PING_MS])
+            .filter(|v| v.is_finite())
+            .collect();
+        if !pings.is_empty() {
+            key(o, "ping_best", false);
+            number(o, pings.iter().cloned().fold(f64::INFINITY, f64::min));
+            key(o, "ping_worst", false);
+            number(o, pings.iter().cloned().fold(f64::NEG_INFINITY, f64::max));
         }
         o.push('}');
         if current {

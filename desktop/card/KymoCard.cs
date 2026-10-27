@@ -192,6 +192,7 @@ namespace Kymo
         public static readonly string[] TileKeys = { "cpu", "memory", "commit", "gpu", "disk", "network" };
         public readonly bool[] Tiles = { true, true, true, true, true, true };
         public int Columns = 2, IssueLines = 6, Opacity = 85;
+        public int Ping = 2;                       // the ping tile: 2 across the card, 1 like the other tiles, 0 not shown
         public bool Charts = true, TopApps = true, Status = true, Clock = true, Locked;
         public ProcLook Procs = new ProcLook();   // the process list's (/api/card "processes"; procs_ in card-look.txt)
 
@@ -202,7 +203,7 @@ namespace Kymo
         {
             var sb = new StringBuilder("# The Kymo card's settings as the recorder last sent them (Settings page, Desktop card): the card\r\n# starts with them until the recorder answers. Change them on the Settings page, not here.\r\n");
             for (int i = 0; i < TileKeys.Length; i++) sb.Append(TileKeys[i] + "=" + B(Tiles[i]) + "\r\n");
-            sb.Append("columns=" + Columns + "\r\nissue_lines=" + IssueLines + "\r\nopacity=" + Opacity + "\r\ncharts=" + B(Charts) + "\r\ntop_apps=" + B(TopApps) +
+            sb.Append("ping=" + Ping + "\r\ncolumns=" + Columns + "\r\nissue_lines=" + IssueLines + "\r\nopacity=" + Opacity + "\r\ncharts=" + B(Charts) + "\r\ntop_apps=" + B(TopApps) +
                 "\r\nstatus=" + B(Status) + "\r\nclock=" + B(Clock) + "\r\nlocked=" + B(Locked) + "\r\n");
             sb.Append(Procs.ToText("procs_"));
             return sb.ToString();
@@ -241,6 +242,7 @@ namespace Kymo
             };
             for (int i = 0; i < TileKeys.Length; i++) l.Tiles[i] = flag(TileKeys[i], true);
             l.Columns = num("columns", 2, 1, 3);
+            l.Ping = num("ping", 0, 0, 2);   // none from a recorder that does not ping
             l.IssueLines = num("issue_lines", 6, 0, 6);
             l.Opacity = num("opacity", 85, 40, 100);
             l.Charts = flag("charts", true); l.TopApps = flag("top_apps", true); l.Status = flag("status", true);
@@ -249,6 +251,20 @@ namespace Kymo
             return l;
         }
     }
+
+    // What the recorder pings (/api/card "ping"): the setting's choice (1 Cloudflare, 2 Google, 3 Quad9, 4 the router, 5
+    // the address typed, 0 off), its label and what is pinged, the router, and how it answers.
+    sealed class PingState
+    {
+        public bool On, Answered, RouterOn;          // Answered: at least once since it was set
+        public int Choice;
+        public string Label = "", Host = "", Address = "", Router = "", Typed = "", Problem = "";
+        public double SilentS = double.NaN;          // no answer for this long (5 s or more), else NaN
+    }
+
+    // Where things are on the card last drawn, for clicks (bitmap px): the ping tile's address, and the box to type
+    // another address in.
+    sealed class CardHits { public RectangleF Ping, PingBox; }
 
     sealed class Snapshot
     {
@@ -260,6 +276,7 @@ namespace Kymo
         // (the recorder's), the busiest on the GPU and the one with the most GPU memory (read by the card itself).
         public string TopIo = "", TopFaults = "", TopGpu = "", TopVram = "";
         public Dictionary<string, double[]> Series = new Dictionary<string, double[]>();
+        public PingState Ping;                 // null: the recorder sent none (an older one, or no answer)
         public string Drive = "C:";
         public string Status = "";             // the recorder's: ok, starting, resuming, stale
         public bool Reached;                   // the recorder answered
@@ -288,6 +305,7 @@ namespace Kymo
             { "cpu_warn", 75 }, { "cpu_crit", 90 }, { "mem_warn", 85 }, { "mem_crit", 92 }, { "commit_warn", 85 }, { "commit_crit", 95 },
             { "paging_warn", 1500 }, { "paging_crit", 5000 }, { "free_warn", 25 }, { "free_crit", 10 }, { "latency_warn", 50 },
             { "latency_crit", 200 }, { "gpu_temp_warn", 78 }, { "gpu_temp_crit", 83 }, { "disk_busy", 90 }, { "vram_full", 95 }, { "perf_limit", 90 },
+            { "ping_warn", 100 }, { "ping_crit", 250 }, { "loss_warn", 2 }, { "loss_crit", 10 },
         };
         static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
         static readonly DateTime Epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
@@ -305,6 +323,8 @@ namespace Kymo
             { "disk", "now", "disk_active" }, { "disk5", "avg5", "disk_active" }, { "readLat5", "avg5", "disk_read_latency_ms" },
             { "writeLat5", "avg5", "disk_write_latency_ms" }, { "diskFree", "last", "disk_free" }, { "diskSize", "last", "disk_size" },
             { "netIn", "now", "net_rx" }, { "netOut", "now", "net_tx" }, { "netErr5", "avg5", "net_errors" },
+            { "ping", "now", "ping_ms" }, { "ping5", "avg5", "ping_ms" }, { "loss5", "avg5", "ping_loss" }, { "jitter", "now", "ping_jitter" },
+            { "router5", "avg5", "router_ms" }, { "routerLoss5", "avg5", "router_loss" },
         };
 
         public static double UnixNow() { return (DateTime.UtcNow - Epoch).TotalSeconds; }
@@ -332,10 +352,10 @@ namespace Kymo
 
         // A change to the recorder's settings (form body key=value), sent as its own page sends it (X-Kymo: 1). The HTTP
         // status, or 0 when the recorder cannot be reached.
-        public static int Post(string path, string body)
+        public static int Post(string path, string body, int timeoutMs = 5000)
         {
             var req = (HttpWebRequest)WebRequest.Create(Base + path);
-            req.Method = "POST"; req.Proxy = null; req.Timeout = 5000; req.ReadWriteTimeout = 5000;
+            req.Method = "POST"; req.Proxy = null; req.Timeout = timeoutMs; req.ReadWriteTimeout = timeoutMs;
             req.ServicePoint.Expect100Continue = false;
             req.ContentType = "application/x-www-form-urlencoded";
             req.Headers["X-Kymo"] = "1";
@@ -436,6 +456,24 @@ namespace Kymo
                     if (!double.IsNaN(v) && !double.IsInfinity(v)) s.V[Figures[i, 0]] = v;
                 }
                 foreach (var k in new[] { "netIn", "netOut" }) if (s.V.ContainsKey(k)) s.V[k] *= 8;   // bytes to bits
+                var hour = Map(root, "hour");
+                foreach (var kv in new[] { Tuple.Create("pingBest", "ping_best"), Tuple.Create("pingWorst", "ping_worst") })
+                {
+                    double v = Num(hour, kv.Item2);
+                    if (!double.IsNaN(v)) s.V[kv.Item1] = v;
+                }
+                var ping = Map(root, "ping");
+                if (ping != null)
+                {
+                    Func<string, bool> flag = k2 => { object o; return ping.TryGetValue(k2, out o) && o is bool && (bool)o; };
+                    double choice = Num(ping, "choice");
+                    s.Ping = new PingState
+                    {
+                        On = flag("on"), Answered = flag("answered"), RouterOn = flag("router_on"), Choice = double.IsNaN(choice) ? 0 : (int)choice,
+                        Label = Text(ping, "label"), Host = Text(ping, "host"), Address = Text(ping, "address"), Router = Text(ping, "router"),
+                        Typed = Text(ping, "typed"), Problem = Text(ping, "problem"), SilentS = Num(ping, "silent_s"),
+                    };
+                }
 
                 // Commit against the most it can reach: RAM plus how far the page file can still grow.
                 double ram = s.Get("memTotal"), committed = s.Get("committed");
@@ -492,6 +530,7 @@ namespace Kymo
                 Tuple.Create("cpu", "cpu", 1.0), Tuple.Create("mem", "mem_used_pct", 1.0),
                 Tuple.Create("commit", "committed", commitMax > 0 ? 100 / commitMax : double.NaN),
                 Tuple.Create("gpu", "gpu", 1.0), Tuple.Create("disk", "disk_active", 1.0), Tuple.Create("net", "net_rx", 8.0),
+                Tuple.Create("ping", "ping_ms", 1.0), Tuple.Create("pingLoss", "ping_loss", 1.0), Tuple.Create("router", "router_ms", 1.0),
             };
             foreach (var line in lines)
             {
@@ -511,7 +550,7 @@ namespace Kymo
             return result;
         }
 
-        static string Ago(double s)
+        internal static string Ago(double s)
         {
             if (double.IsNaN(s)) return "a while";
             return s < 120 ? Whole(s) + " s" : s < 7200 ? Whole(s / 60) + " min" : Whole(s / 3600) + " h";
@@ -636,6 +675,23 @@ namespace Kymo
             v = s.Get("gpuSlow"); if (!double.IsNaN(v) && v > 0) s.Issues.Add(new Issue("warn", "GPU slowed down (thermal or hardware limit)"));
             v = s.Get("limit5"); if (!double.IsNaN(v) && v < s.Lim("perf_limit")) s.Issues.Add(new Issue("warn", "CPU held back: performance limit " + Pct(v)));
             v = s.Get("netErr5"); if (!double.IsNaN(v) && v > 0) s.Issues.Add(new Issue("warn", "Network errors on an adapter"));
+            // The ping, once its address has answered (one that never does is no loss: the tile says so), with the
+            // router's figure beside it: that tells the provider's trouble from the Wi-Fi's.
+            var p = s.Ping;
+            if (p != null && p.On && p.Answered)
+            {
+                string to = " to " + PingTo(p);
+                v = s.Get("loss5"); if (!double.IsNaN(v) && v >= s.Lim("loss_warn")) s.Issues.Add(new Issue(Level(v, s.Lim("loss_warn"), s.Lim("loss_crit")), "Packet loss " + Pct(v) + to + RouterPart(s, "routerLoss5", x => "your router " + Pct(x))));
+                v = s.Get("ping5"); if (!double.IsNaN(v) && v >= s.Lim("ping_warn")) s.Issues.Add(new Issue(Level(v, s.Lim("ping_warn"), s.Lim("ping_crit")), "Ping slow: " + Whole(v) + " ms" + to + RouterPart(s, "router5", x => "router " + Whole(x) + " ms")));
+            }
+        }
+        // The address in a sentence: "Cloudflare", "your router", "example.com" (cut to 16 characters).
+        internal static string PingTo(PingState p) { return p.Choice == 4 ? "your router" : p.Label.Length > 16 ? p.Label.Substring(0, 15) + "\u2026" : p.Label; }
+        // " · router 3 ms": the router's figure, when it is pinged too (not when it is the address).
+        static string RouterPart(Snapshot s, string key, Func<double, string> f)
+        {
+            double x = s.Get(key);
+            return s.Ping.RouterOn && s.Ping.Choice != 4 && !double.IsNaN(x) ? " \u00b7 " + f(x) : "";
         }
         static double Nz(double v) { return double.IsNaN(v) ? 0 : v; }
         static string Top(string app) { return app.Length > 0 ? " · top: " + app : ""; }
@@ -791,9 +847,10 @@ namespace Kymo
         {
             Func<float, float> S = v => v * k;
             int cols = Math.Max(1, Math.Min(3, look.Columns));
-            int rows = (look.Tiles.Count(t => t) + cols - 1) / cols;
+            int rows = (look.Tiles.Count(t => t) + (look.Ping == 1 ? 1 : 0) + cols - 1) / cols;
             float gap = S(10), tileH = S(look.Charts ? 96 : 62);
-            float tilesH = rows > 0 ? S(6) + rows * tileH + (rows - 1) * gap : 0;
+            bool wide = look.Ping == 2;
+            float tilesH = (rows > 0 || wide ? S(6) : 0) + (rows > 0 ? rows * tileH + (rows - 1) * gap : 0) + (wide ? (rows > 0 ? gap : 0) + S(WideH(look)) : 0);
             float footH = FootLines(look) * S(20);
             return new Size((int)Math.Ceiling(S(WidthFor(cols) + (float)wider)),
                 (int)Math.Ceiling(S(18) + S(30) + S(10) + S(36) + S(8) + lines * S(24) + tilesH + (footH > 0 ? S(14) + footH : 0) + S(18) + S((float)taller)));
@@ -801,13 +858,16 @@ namespace Kymo
 
         // Wider: the tiles, the bar and the lines widen. Taller: the tiles (and their charts) share the extra height;
         // without tiles it stays empty at the bottom.
-        public static Bitmap Render(Snapshot s, float k, double wider = 0, double taller = 0)
+        public static Bitmap Render(Snapshot s, float k, double wider = 0, double taller = 0, CardHits hits = null)
         {
             var look = s.Look;
             Func<float, float> S = v => v * k;
             var issues = Shown(s);
             int cols = Math.Max(1, Math.Min(3, look.Columns));
-            var shown = Enumerable.Range(0, 6).Where(i => look.Tiles[i]).ToList();
+            hits = hits ?? new CardHits();
+            hits.Ping = hits.PingBox = RectangleF.Empty;
+            // The six tiles, then the ping's when it is one like them (across the card, it has a row of its own below).
+            var shown = Enumerable.Range(0, 7).Where(i => i < 6 ? look.Tiles[i] : look.Ping == 1).ToList();
             int rows = (shown.Count + cols - 1) / cols;
             float pad = S(18), gap = S(10), tileH = S(look.Charts ? 96 : 62);
             var size = Measure(look, issues.Count, k, wider, taller);
@@ -855,7 +915,7 @@ namespace Kymo
                     Ink.Draw(g, bmp, i.Text, fIssue, Text, new RectangleF(pad + S(18), y, w - 2 * pad - S(18), S(22)), ellipsis);
                     y += S(24);
                 }
-                if (rows > 0) y += S(6);
+                if (rows > 0 || look.Ping == 2) y += S(6);
 
                 double commitMax = s.Get("commitMax"), committed = s.Get("committed");
                 string commitSub = double.IsNaN(commitMax) || double.IsNaN(committed) ? "" :
@@ -869,6 +929,7 @@ namespace Kymo
                     Tuple.Create("GPU", s.GpuState == "off" ? "off" : Fmt(s.Get("gpu"), Source.Pct), Fmt(temp, v => Source.Whole(v) + " \u00b0C"), Lv(temp, s.Lim("gpu_temp_warn"), s.Lim("gpu_temp_crit")), "gpu", 100.0),
                     Tuple.Create("Disk " + s.Drive + " active", Fmt(s.Get("disk"), Source.Pct), lat > 0 ? (Math.Floor(lat * 10) / 10).ToString("0.0", Inv) + " ms" : "", !double.IsNaN(disk5) && disk5 >= s.Lim("disk_busy") ? "warn" : "ok", "disk", 100.0),
                     Tuple.Create("Network", Fmt(s.Get("netIn"), v => "\u2193 " + Source.Bits(v)), Fmt(s.Get("netOut"), v => "\u2191 " + Source.Bits(v)), "ok", "net", 0.0),
+                    Tuple.Create("", PingValue(s), PingSub(s, false), PingLevel(s), "ping", 0.0),
                 };
                 using (var tileBrush = new SolidBrush(TileBack))
                     for (int j = 0; j < shown.Count; j++)
@@ -876,13 +937,22 @@ namespace Kymo
                         var t = tiles[shown[j]];
                         float x = pad + (j % cols) * (tileW + gap), ty = y + (j / cols) * (tileH + gap);
                         using (var tp = Round(x, ty, tileW, tileH, S(10))) g.FillPath(tileBrush, tp);
-                        Ink.Draw(g, bmp, t.Item1, fLabel, Dim, x + S(10), ty + S(7));
-                        Ink.Draw(g, bmp, t.Item2, fValue, Of(t.Item4), x + S(8), ty + S(22));
-                        Ink.Draw(g, bmp, t.Item3, fSub, Dim, new RectangleF(x + S(6), ty + S(9), tileW - S(16), S(18)), right);
+                        float subFrom = x + S(6);
+                        if (shown[j] == 6) subFrom = Math.Max(subFrom, PingLabel(g, bmp, s, x + S(10), ty + S(7), x + tileW - S(10), fLabel, S, hits, false) + S(6));
+                        else Ink.Draw(g, bmp, t.Item1, fLabel, Dim, x + S(10), ty + S(7));
+                        Ink.Draw(g, bmp, t.Item2, fValue, shown[j] == 6 && (s.Ping == null || !s.Ping.On) ? Dim : Of(t.Item4), x + S(8), ty + S(22));
+                        string sub = shown[j] == 6 && Ink.Width(t.Item3, fSub) > x + tileW - S(10) - subFrom ? "" : t.Item3;
+                        Ink.Draw(g, bmp, sub, fSub, Dim, new RectangleF(subFrom, ty + S(9), Math.Max(0, x + tileW - S(10) - subFrom), S(18)), right);
                         double[] pts;
                         if (look.Charts && s.Series.TryGetValue(t.Item5, out pts) && pts.Length >= 4) Spark(g, pts, t.Item6, Of(t.Item4), x + S(8), ty + tileH - S(8), tileW - S(16), S(30) + stretch, S(1.6f));
                     }
                 if (rows > 0) y += rows * tileH + (rows - 1) * gap;
+                if (look.Ping == 2)
+                {
+                    if (rows > 0) y += gap;
+                    WidePing(g, bmp, s, pad, y, w - 2 * pad, S(WideH(look)), look.Charts, S, fLabel, fValue, fSub, hits);
+                    y += S(WideH(look));
+                }
                 y += S(14);
 
                 if (look.TopApps)
@@ -912,6 +982,127 @@ namespace Kymo
         }
 
         static string Fmt(double v, Func<double, string> f) { return double.IsNaN(v) ? "\u2013" : f(v); }
+
+        // The ping tile across the card: taller, for a wider chart (logical px).
+        static float WideH(Look l) { return l.Charts ? 108 : 62; }
+        static string Ms(double v) { return v < 1 ? "<1 ms" : Source.Whole(v) + " ms"; }
+
+        // Its value: the round trip of the last 30 s; or why there is none.
+        static string PingValue(Snapshot s)
+        {
+            var p = s.Ping;
+            if (p == null) return "\u2013";
+            if (!p.On) return "off";
+            if (p.Problem == "no_name") return "no name";
+            if (p.Problem == "no_route") return "no router";
+            if (!double.IsNaN(p.SilentS)) return "no answer";
+            return Fmt(s.Get("ping"), Ms);
+        }
+
+        // Its colour: the 5-minute round trip and loss against the alerts; silent, orange (red once it had answered).
+        static string PingLevel(Snapshot s)
+        {
+            var p = s.Ping;
+            if (p == null || !p.On) return "ok";
+            if (p.Problem.Length > 0 || !double.IsNaN(p.SilentS)) return p.Answered && p.Problem.Length == 0 ? "crit" : "warn";
+            string a = Lv(s.Get("ping5"), s.Lim("ping_warn"), s.Lim("ping_crit")), b = Lv(s.Get("loss5"), s.Lim("loss_warn"), s.Lim("loss_crit"));
+            return a == "crit" || b == "crit" ? "crit" : a == "warn" || b == "warn" ? "warn" : "ok";
+        }
+
+        // At its top right: how long it has been silent; else the loss over 5 minutes (and, across the card, the jitter).
+        static string PingSub(Snapshot s, bool wide)
+        {
+            var p = s.Ping;
+            if (p == null || !p.On || p.Problem.Length > 0) return "";
+            if (!double.IsNaN(p.SilentS)) return "for " + Source.Ago(p.SilentS);
+            double loss = s.Get("loss5"), jitter = s.Get("jitter");
+            string l = double.IsNaN(loss) ? "" : loss <= 0 ? "no loss" : loss < 1 ? "loss <1 %" : "loss " + Source.Pct(loss);
+            return wide && !double.IsNaN(jitter) ? "jitter " + Ms(jitter) + (l.Length > 0 ? " \u00b7 " + l : "") : l;
+        }
+
+        // Across the card, beside its value: what the router says of a trouble, why an address cannot be pinged, or the
+        // best and worst of the hour.
+        static string PingNote(Snapshot s, string level)
+        {
+            var p = s.Ping;
+            if (p == null) return "";
+            if (!p.On) return "Click \u201coff\u201d to choose an address";
+            if (p.Problem == "no_name") return "The name is not found.";
+            if (p.Problem == "no_route") return "No router: this PC is not on a network.";
+            if (!double.IsNaN(p.SilentS) && !p.Answered)
+                return "Never answered: some servers ignore ping.";
+            double r = s.Get("router5"), rl = s.Get("routerLoss5");
+            if (level != "ok" && p.RouterOn && p.Choice != 4 && !double.IsNaN(r))
+                return r < s.Lim("ping_warn") && Nz(rl) < s.Lim("loss_warn") ? "router " + Ms(r) + ": the trouble is past your router" : "router " + Ms(r) + " too: the trouble is your Wi-Fi or cable";
+            double best = s.Get("pingBest"), worst = s.Get("pingWorst");
+            return double.IsNaN(best) || double.IsNaN(worst) ? "" : "best " + Ms(best).Replace(" ms", "") + " \u00b7 worst " + Ms(worst) + " in the hour";
+        }
+
+        // "Ping · Cloudflare 1.1.1.1 ˅" at (x, y), at most to `right`: the name, and across the card the address; where a
+        // click opens the ping's menu (`hits`). Its right end.
+        static float PingLabel(Graphics g, Bitmap bmp, Snapshot s, float x, float y, float right, Font f, Func<float, float> S, CardHits hits, bool wide)
+        {
+            var p = s.Ping;
+            string name = p == null ? "\u2013" : !p.On ? "off" : p.Label.Length > (wide ? 28 : 12) ? p.Label.Substring(0, wide ? 27 : 11) + "\u2026" : p.Label;
+            string address = !wide || p == null || !p.On ? "" : p.Choice >= 1 && p.Choice <= 3 ? p.Host : p.Choice == 4 ? p.Address : "";
+            float cx = x;
+            Ink.Draw(g, bmp, "Ping \u00b7 ", f, Dim, cx, y); cx += Ink.Width("Ping \u00b7 ", f) - S(4);
+            float nameX = cx;
+            Ink.Draw(g, bmp, name, f, Text, cx, y); cx += Ink.Width(name, f) - S(4);
+            if (address.Length > 0) { Ink.Draw(g, bmp, address, f, Dim, cx, y); cx += Ink.Width(address, f) - S(4); }
+            cx += S(5);
+            if (p != null)
+            {
+                using (var pen = new Pen(Dim, Math.Max(1f, S(1.4f))) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                    g.DrawLines(pen, new[] { new PointF(cx, y + S(8)), new PointF(cx + S(4), y + S(12)), new PointF(cx + S(8), y + S(8)) });
+                cx += S(10);
+                hits.Ping = new RectangleF(x - S(4), y - S(3), cx - x + S(8), S(22));
+                hits.PingBox = new RectangleF(nameX, y - S(3), Math.Max(S(60), Math.Min(S(240), right - nameX)), S(22));
+            }
+            return cx;
+        }
+
+        // The ping tile across the card: what is pinged, its value and a note beside it, the loss and jitter, and the last
+        // hour: its round trip, the router's dashed under it, a mark at the top for each minute with packets lost.
+        static void WidePing(Graphics g, Bitmap bmp, Snapshot s, float x, float y, float w, float h, bool charts, Func<float, float> S, Font fLabel, Font fValue, Font fSub, CardHits hits)
+        {
+            using (var tb = new SolidBrush(TileBack)) using (var tp = Round(x, y, w, h, S(10))) g.FillPath(tb, tp);
+            string level = PingLevel(s);
+            float lx = PingLabel(g, bmp, s, x + S(10), y + S(7), x + w - S(10), fLabel, S, hits, true);
+            float subRoom = Math.Max(0, x + w - S(10) - lx - S(12));
+            string sub = PingSub(s, true);
+            if (Ink.Width(sub, fSub) > subRoom) sub = PingSub(s, false);
+            if (Ink.Width(sub, fSub) > subRoom) sub = "";
+            Ink.Draw(g, bmp, sub, fSub, Dim, new RectangleF(lx + S(12), y + S(9), subRoom, S(18)), Right);
+            string value = PingValue(s);
+            Ink.Draw(g, bmp, value, fValue, s.Ping == null || !s.Ping.On ? Dim : Of(level), x + S(8), y + S(22));
+            float vx = x + S(8) + Ink.Width(value, fValue) + S(6);
+            Ink.Draw(g, bmp, PingNote(s, level), fSub, Dim, new RectangleF(vx, y + S(24), Math.Max(0, x + w - S(10) - vx), S(30)), Note);
+            if (!charts) return;
+            double[] pts, router, loss;
+            s.Series.TryGetValue("ping", out pts); s.Series.TryGetValue("router", out router); s.Series.TryGetValue("pingLoss", out loss);
+            float gx = x + S(8), gy = y + h - S(8), gw = w - S(16), gh = S(40);
+            double max = 1;
+            foreach (var line in new[] { pts, router }) if (line != null) for (int j = 1; j < line.Length; j += 2) max = Math.Max(max, line[j] * 1.1);
+            if (router != null && router.Length >= 4) Dashed(g, router, max, Dim, gx, gy, gw, gh, S(1.2f), S(4));
+            if (pts != null && pts.Length >= 4) Spark(g, pts, max, Of(level), gx, gy, gw, gh, S(1.6f));
+            if (loss != null && s.Ping != null && s.Ping.Answered)
+                using (var lb = new SolidBrush(Crit))
+                    for (int j = 0; j + 1 < loss.Length; j += 2)
+                        if (loss[j + 1] > 0) g.FillRectangle(lb, gx + gw * (float)loss[j] - gw / 120 - S(1.2f), gy - gh - S(4), S(2.4f), S(6));
+        }
+
+        static readonly StringFormat Right = new StringFormat { Alignment = StringAlignment.Far };
+        static readonly StringFormat Note = new StringFormat { LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap };
+
+        static void Dashed(Graphics g, double[] pts, double max, Color c, float gx, float gy, float gw, float gh, float width, float dash)
+        {
+            int n = pts.Length / 2;
+            var poly = new PointF[n];
+            for (int j = 0; j < n; j++)
+                poly[j] = new PointF(gx + gw * (float)Math.Min(1.0, pts[2 * j]), gy - gh * (float)Math.Min(1.0, Math.Max(0.0, pts[2 * j + 1] / max)));
+            using (var pen = new Pen(c, width) { DashPattern = new[] { dash / width, dash / width } }) g.DrawLines(pen, poly);
+        }
         static string Lv(double v, double warn, double crit) { return double.IsNaN(v) ? "ok" : Source.Level(v, warn, crit); }
         static double Nz(double v) { return double.IsNaN(v) ? 0 : v; }
 
@@ -1158,7 +1349,23 @@ namespace Kymo
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
             if (foregroundHook != IntPtr.Zero) Native.UnhookWinEvent(foregroundHook);
+            if (menuOwner != null) menuOwner.DestroyHandle();
             base.OnFormClosed(e);
+        }
+
+        NativeWindow menuOwner;
+        // Owns a widget's menus and the questions after them: never shown.
+        protected IntPtr MenuOwner
+        {
+            get
+            {
+                if (menuOwner == null)
+                {
+                    menuOwner = new NativeWindow();
+                    menuOwner.CreateHandle(new CreateParams { Style = unchecked((int)0x80000000), ExStyle = 0x80 });   // WS_POPUP, WS_EX_TOOLWINDOW
+                }
+                return menuOwner.Handle;
+            }
         }
 
         // Work area and scale of the card's monitor, in physical pixels (the process is per-monitor DPI aware): the
@@ -1805,7 +2012,22 @@ namespace Kymo
         protected override bool Ready { get { return last != null; } }
         protected override Size Measure(float k, double wider, double taller) { return Card.Measure(last.Look, Card.Shown(last).Count, k, wider, taller); }
         protected override Size MeasureMost(float k, double wider, double taller) { return Card.Measure(look, Math.Max(0, Math.Min(6, look.IssueLines)), k, wider, taller); }
-        protected override Bitmap Render(float k, double wider, double taller) { drawnMinute = DateTime.Now.Minute; return Card.Render(last, k, wider, taller); }
+        protected override Bitmap Render(float k, double wider, double taller)
+        {
+            drawnMinute = DateTime.Now.Minute;
+            drawnK = k;
+            var bmp = Card.Render(last, k, wider, taller, hits);
+            if (addressBox != null && addressBox.Visible && !hits.PingBox.IsEmpty) addressBox.Bounds = OnScreen(hits.PingBox);   // the card moved or grew
+            return bmp;
+        }
+        float drawnK = 1;      // the scale last drawn at (the monitor's and the card's size)
+        bool refetch;          // a change went in while a fetch was on its way: another one after it
+
+        Rectangle OnScreen(RectangleF r)
+        {
+            var o = Origin();
+            return new Rectangle(o.X + (int)Math.Round(r.X), o.Y + (int)Math.Round(r.Y), (int)Math.Round(r.Width), (int)Math.Round(r.Height));
+        }
         protected override void TestStart() { last = new Snapshot { Up = true, Look = look }; Draw(); }
         protected override void VisibleTick()
         {
@@ -1817,8 +2039,84 @@ namespace Kymo
             if (last != null) Draw();
             if (!fetching && Due()) StartFetch();
         }
-        protected override void Clicked(Point at, bool second) { Open("/"); }
+        // A click opens the dashboards; on the ping tile's address, the ping's menu.
+        protected override void Clicked(Point at, bool second)
+        {
+            var o = Origin();
+            if (!second && last != null && last.Ping != null && hits.Ping.Contains(new PointF(at.X - o.X, at.Y - o.Y))) { PingMenu(at); return; }
+            Open("/");
+        }
         protected override void RightClicked(Point at) { Open("/#/settings?group=desktop-card"); }
+
+        readonly CardHits hits = new CardHits();
+        SearchBox addressBox;
+        internal static Func<string, int> SendPing;   // for --selftest (else: Source.Post; never in a test)
+
+        // The ping's menu: the addresses to choose from (the one pinged dotted), another one to type, the settings.
+        void PingMenu(Point at)
+        {
+            IntPtr before = ProcMenu.Foreground();
+            ProcMenu.MoveOwner(MenuOwner, at);
+            var ping = last.Ping;   // as the menu shows it (an answer may come while it is open)
+            int id = ProcMenu.Show(MenuOwner, at, PingItems(ping));
+            Choose(id, ping);
+            if (id != 210 && id != 211) ProcMenu.GiveBack(MenuOwner, before);
+        }
+
+        // What an entry of the ping's menu does (0: none chosen), for the ping as the menu showed it.
+        internal void Choose(int id, PingState ping)
+        {
+            if (id >= 201 && id <= 205) SetPing(id - 200, id == 205 ? ping.Typed : null);
+            else if (id == 210)
+            {
+                // Another address: typed over the address, taken on Enter.
+                if (addressBox == null) addressBox = new SearchBox(null, text => { if (text.Length > 0) SetPing(5, text); });
+                addressBox.Open(OnScreen(hits.PingBox), 12.5f * drawnK, ping.Choice == 5 ? ping.Host : "");
+            }
+            else if (id == 211) Open("/#/settings?group=ping");
+        }
+
+        // The ping menu's entries: 201 to 205 the setting's choices (205 the address typed last), 210 another address,
+        // 211 the settings.
+        internal static List<ProcMenu.Item> PingItems(PingState p)
+        {
+            Func<string, string, string> two = (a, b) => b.Length > 0 ? a + "\t" + b : a;   // the address in a column on the right
+            var items = new List<ProcMenu.Item> { new ProcMenu.Item { Text = "Ping to", Grayed = true }, new ProcMenu.Item() };
+            items.Add(new ProcMenu.Item { Text = two("Cloudflare", "1.1.1.1"), Id = 201, Radio = true, Checked = p.Choice == 1 });
+            items.Add(new ProcMenu.Item { Text = two("Google", "8.8.8.8"), Id = 202, Radio = true, Checked = p.Choice == 2 });
+            items.Add(new ProcMenu.Item { Text = two("Quad9", "9.9.9.9"), Id = 203, Radio = true, Checked = p.Choice == 3 });
+            items.Add(new ProcMenu.Item { Text = two("Your router", p.Router), Id = 204, Radio = true, Checked = p.Choice == 4 });
+            if (p.Typed.Length > 0) items.Add(new ProcMenu.Item { Text = two(p.Typed.Replace("&", "&&"), p.Choice == 5 ? "" : "typed before"), Id = 205, Radio = true, Checked = p.Choice == 5 });
+            items.Add(new ProcMenu.Item());
+            items.Add(new ProcMenu.Item { Text = "Another address\u2026", Id = 210 });
+            items.Add(new ProcMenu.Item());
+            items.Add(new ProcMenu.Item { Text = "Ping settings", Id = 211 });
+            return items;
+        }
+
+        // The recorder told what to ping (its settings, as the Settings page sends them), then asked for the card again.
+        void SetPing(int choice, string host)
+        {
+            string body = "ping_target=" + choice.ToString(CultureInfo.InvariantCulture) + (host != null ? "&ping_host=" + Uri.EscapeDataString(host) : "");
+            // The recorder applies a change within 30 s (its loop takes it): waited for that long.
+            var send = SendPing ?? (Test ? null : (Func<string, int>)(b => Source.Post("/api/settings", b, 35000)));
+            if (send == null) return;
+            Action<int> done = status =>
+            {
+                Log("ping " + body + ": " + status);
+                if (status >= 200 && status < 300) { if (fetching) refetch = true; else StartFetch(); }
+                else ProcActions.Tell(MenuOwner, status == 0 ? "Kymo could not reach its recorder to change the address."
+                    : status == 400 && host != null ? "Kymo cannot ping \u201c" + host + "\u201d: type a name such as example.com or an address such as 192.0.2.1."
+                    : "The recorder did not take the change (HTTP " + status + ").");
+            };
+            if (Test) { done(send(body)); return; }
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                int status;
+                try { status = send(body); } catch (Exception e) { status = 0; Log("sending the ping address: " + e.Message); }
+                try { BeginInvoke((MethodInvoker)delegate { done(status); }); } catch { }
+            });
+        }
         protected override void OnShiftWheel(int delta) { OpacityWheel(delta); }
 
         // Shift + scroll over the card: its background 5 % more or less opaque a notch, from 40 to 100 % (the Settings
@@ -1898,6 +2196,7 @@ namespace Kymo
         internal void Receive(Snapshot s) { Arrived(s); Draw(); }
         internal int OpacityShown { get { return last != null ? last.Look.Opacity : look.Opacity; } }
         internal void FlushOpacity() { if (opacitySend.Enabled) SendOpacityNow(); }
+        internal SearchBox AddressBox { get { return addressBox; } }
 
         // Fetch once each new sample is in: the recorder samples every 10 s (interval_s), so a second after the next
         // sample's time; after 5 minutes without input, every third sample. A sample that should be in but is not is
@@ -1929,7 +2228,7 @@ namespace Kymo
                 try { s = source.Fetch(); }
                 catch (Exception e) { s = new Snapshot { Up = false }; s.Issues.Add(new Issue("crit", "Widget error: " + e.Message)); Log("fetch: " + e); }
                 s.Serial = serial;
-                try { BeginInvoke((MethodInvoker)delegate { fetching = false; Arrived(s); Draw(); }); } catch { }
+                try { BeginInvoke((MethodInvoker)delegate { fetching = false; Arrived(s); Draw(); if (refetch) { refetch = false; StartFetch(); } }); } catch { }
             });
         }
 
@@ -2089,7 +2388,8 @@ namespace Kymo
             Check(w.ZoneAt(corner) == 9 && w.ZoneAt(Mid(b)) == 0 && w.ZoneAt(new Point(b.Left + 2, Mid(b).Y)) == 1 && w.ZoneAt(new Point(b.Right - 2, b.Top + 2)) == 6,
                 "edges and corners are handles, the middle is not");
             w.Press(corner);
-            for (int i = 1; i <= 10; i++) w.DragTo(new Point(corner.X - P(94) * i / 10, corner.Y + P(98) * i / 10));
+            var made = Card.Measure(w.CurrentLook, 0, 1f);   // a fifth of it each way: 120 %
+            for (int i = 1; i <= 10; i++) w.DragTo(new Point(corner.X - P(made.Width * 0.2) * i / 10, corner.Y + P(made.Height * 0.2) * i / 10));
             var big = w.WindowRect;
             Check(w.SizeShown == 120 && big.Right == b.Right && big.Top == b.Top && Math.Abs(big.Width - 470 * k * 1.2) <= 1,
                 "pulled out by its bottom-left corner: 120 %, its top-right corner stays (" + R(big) + ")");
@@ -2098,11 +2398,11 @@ namespace Kymo
             Check(s.Size == 120 && s.Corner == "top-right" && s.X == 28 && s.Y == 28 && w.WindowRect == big, "saved: 120 %, still 28 px from the top-right corner (" + s.Size + ")");
             corner = new Point(big.Left + 2, big.Bottom - 3);
             w.Press(corner);
-            for (int i = 1; i <= 10; i++) w.DragTo(new Point(corner.X + P(80) * i / 10, corner.Y - P(84) * i / 10));
+            for (int i = 1; i <= 10; i++) w.DragTo(new Point(corner.X + P(made.Width * 0.17) * i / 10, corner.Y - P(made.Height * 0.17) * i / 10));
             w.Release();
             Check(Spot.Load(file).Size == 100 && w.WindowRect == b, "pushed back near 100 %: exactly 100 % (" + R(w.WindowRect) + ")");
             w.Press(new Point(b.Left + 2, b.Bottom - 3));
-            for (int i = 1; i <= 10; i++) w.DragTo(new Point(b.Left + 2 + P(400) * i / 10, b.Bottom - 3 - P(400) * i / 10));
+            for (int i = 1; i <= 10; i++) w.DragTo(new Point(b.Left + 2 + P(made.Width * 0.85) * i / 10, b.Bottom - 3 - P(made.Height * 0.85) * i / 10));
             Check(w.SizeShown == 60, "never under 60 % (" + w.SizeShown + ")");
             w.Release();
 
@@ -2297,18 +2597,18 @@ namespace Kymo
 
             // ---- what it shows (the recorder's settings), drawn at the usual size
             Func<Look, Size> sizeOf = l => { using (var bmp = Card.Render(new Snapshot { Up = true, Look = l }, 1f)) return bmp.Size; };
-            Check(sizeOf(new Look()) == new Size(470, 488), "the usual card: 470 x 488 (" + sizeOf(new Look()) + ")");
-            Check(sizeOf(new Look { Columns = 3 }) == new Size(692, 382), "3 tiles a row: 692 x 382 (" + sizeOf(new Look { Columns = 3 }) + ")");
-            Check(sizeOf(new Look { Columns = 1 }) == new Size(300, 826), "1 tile a row: 300 x 826, the top apps on two lines (" + sizeOf(new Look { Columns = 1 }) + ")");
-            Check(sizeOf(new Look { Charts = false }) == new Size(470, 386), "no charts: shorter tiles (" + sizeOf(new Look { Charts = false }) + ")");
-            var bare = new Look { TopApps = false, Status = false };
+            Check(sizeOf(new Look()) == new Size(470, 606), "the usual card, the ping tile across it: 470 x 606 (" + sizeOf(new Look()) + ")");
+            Check(sizeOf(new Look { Columns = 3 }) == new Size(692, 500), "3 tiles a row: 692 x 500 (" + sizeOf(new Look { Columns = 3 }) + ")");
+            Check(sizeOf(new Look { Columns = 1 }) == new Size(300, 944), "1 tile a row: 300 x 944, the top apps on two lines (" + sizeOf(new Look { Columns = 1 }) + ")");
+            Check(sizeOf(new Look { Charts = false }) == new Size(470, 458), "no charts: shorter tiles (" + sizeOf(new Look { Charts = false }) + ")");
+            var bare = new Look { TopApps = false, Status = false, Ping = 0 };
             for (int i = 0; i < 6; i++) bare.Tiles[i] = false;
             Check(sizeOf(bare) == new Size(470, 120), "no tiles, no lines below: the header and the bar only (" + sizeOf(bare) + ")");
             var four = new Look();
             four.Tiles[3] = four.Tiles[5] = false;
-            Check(sizeOf(four) == new Size(470, 382), "4 tiles: 2 rows (" + sizeOf(four) + ")");
+            Check(sizeOf(four) == new Size(470, 500), "4 tiles: 2 rows (" + sizeOf(four) + ")");
             using (var bmp = Card.Render(new Snapshot { Up = true, Look = new Look() }, 1f, 100, 60))
-                Check(bmp.Size == new Size(570, 548) && Card.Measure(new Look(), 0, 1f, 100, 60) == bmp.Size, "stretched 100 px wider and 60 taller: 570 x 548, measured the same (" + bmp.Size + ")");
+                Check(bmp.Size == new Size(570, 666) && Card.Measure(new Look(), 0, 1f, 100, 60) == bmp.Size, "stretched 100 px wider and 60 taller: 570 x 666, measured the same (" + bmp.Size + ")");
             var roomy = new Spot { Wider = 120, Taller = 33 };
             string spotFile = Path.Combine(Path.GetDirectoryName(file), "spot-check.txt");
             roomy.Save(spotFile);
@@ -2353,6 +2653,55 @@ namespace Kymo
                 }
             Check(widestPx <= room, "every issue line with an app fits the card: the widest " + Math.Round(widestPx) + " px of " + room + " (" + widestText + ")");
             }
+
+            // The ping tile: across the card a row of its own, like the others a seventh tile, or none.
+            Check(Look.From(new Dictionary<string, object>()).Ping == 0 && Look.From(new Dictionary<string, object> { { "ping", 2 } }).Ping == 2,
+                "the ping tile only from a recorder that sends its setting (an older one pings nothing)");
+            Func<int, Size> sized = mode => Card.Measure(new Look { Ping = mode }, 0, 1f);
+            Check(sized(2).Height - sized(0).Height == 118 && sized(1).Height - sized(0).Height == 106 && sized(2).Width == sized(0).Width,
+                "the ping tile: across the card a row 118 px high, or a seventh tile (a row more, 106 px)");
+            // Its issue lines name the router's figures when it is pinged too; an address that never answered gives none.
+            var ps = new Snapshot { Up = true, Look = new Look(), Ping = new PingState { On = true, Answered = true, RouterOn = true, Choice = 1, Label = "Cloudflare", Host = "1.1.1.1", Address = "1.1.1.1", Router = "192.168.1.1" } };
+            ps.V["ping"] = 182; ps.V["ping5"] = 182; ps.V["loss5"] = 12; ps.V["router5"] = 3; ps.V["routerLoss5"] = 0; ps.V["jitter"] = 41;
+            Source.AddIssues(ps, double.NaN, "");
+            var pingLines = ps.Issues.Select(i => i.Level + ": " + i.Text).ToList();
+            Check(pingLines.Contains("crit: Packet loss 12 % to Cloudflare \u00b7 your router 0 %") && pingLines.Contains("warn: Ping slow: 182 ms to Cloudflare \u00b7 router 3 ms"),
+                "ping issues: the loss and a slow ping, with the router's figures (" + string.Join(" | ", pingLines) + ")");
+            var never = new Snapshot { Up = true, Look = new Look(), Ping = new PingState { On = true, Choice = 5, Label = "quiet.example", Host = "quiet.example", SilentS = 40 } };
+            never.V["loss5"] = 100;
+            Source.AddIssues(never, double.NaN, "");
+            Check(never.Issues.Count == 0, "an address that never answered: no issue, the tile says so (" + never.Issues.Count + ")");
+            var longPing = new Snapshot { Up = true, Look = new Look(), Ping = new PingState { On = true, Answered = true, RouterOn = true, Choice = 5, Label = "a-rather-long-host-name.example.com" } };
+            longPing.V["ping5"] = 999; longPing.V["loss5"] = 100; longPing.V["router5"] = 999; longPing.V["routerLoss5"] = 100;
+            Source.AddIssues(longPing, double.NaN, "");
+            float pingRoom = 470 - 2 * 18 - 18, pingWidest = 0;
+            using (var f = new Font("Segoe UI", 14, GraphicsUnit.Pixel)) foreach (var i in longPing.Issues) pingWidest = Math.Max(pingWidest, Ink.Width(i.Text, f));
+            Check(longPing.Issues.Count == 2 && pingWidest <= pingRoom, "the ping's issue lines fit the card with a long address: " + Math.Round(pingWidest) + " px of " + pingRoom);
+            // Its address: where a click opens its menu, on the tile across the card.
+            var ch = new CardHits();
+            var drawn = Card.Measure(ps.Look, Card.Shown(ps).Count, 1f);
+            using (Card.Render(ps, 1f, 0, 0, ch)) { }
+            Check(!ch.Ping.IsEmpty && ch.Ping.Y > drawn.Height / 2 && ch.Ping.Bottom < drawn.Height && ch.PingBox.Width >= 60,
+                "the ping's address on its tile across the card (" + ch.Ping + ")");
+            // Its menu: the address pinged dotted, the router's address, another address, the settings.
+            var pi = WidgetWindow.PingItems(new PingState { On = true, Choice = 5, Label = "github.com", Host = "github.com", Typed = "github.com", Router = "192.168.1.1" });
+            Check(pi.Single(i => i.Checked).Id == 205 && pi.Single(i => i.Id == 204).Text == "Your router\t192.168.1.1" && pi.Any(i => i.Id == 210) && pi.Last().Id == 211,
+                "the ping menu: the address pinged dotted, the router's address, another address, the settings");
+            // Chosen, or typed (taken on Enter, Escape leaves it): sent to the recorder's settings (here, to the test).
+            var bodies = new List<string>();
+            WidgetWindow.SendPing = sentBody => { bodies.Add(sentBody); return 200; };
+            IntPtr fgNow = Native.GetForegroundWindow();
+            w.Receive(ps);
+            w.Choose(202, ps.Ping);
+            w.Choose(210, ps.Ping);
+            var box = w.AddressBox;
+            if (box != null) { box.Type("Example.com"); box.Key(Keys.Enter); }
+            w.Choose(210, ps.Ping);
+            if (box != null) { box.Type("other.example"); box.Key(Keys.Escape); }
+            WidgetWindow.SendPing = null;
+            if (fgNow != IntPtr.Zero) Native.SetForegroundWindow(fgNow);
+            Check(string.Join(" | ", bodies) == "ping_target=2 | ping_target=5&ping_host=Example.com",
+                "choosing Google, then typing an address and Enter, sends them; Escape sends nothing (" + string.Join(" | ", bodies) + ")");
 
             File.Delete(file);
             return failed;

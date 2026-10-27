@@ -30,6 +30,8 @@ pub enum Kind {
     Bool,
     /// "" (the system drive) or a drive letter the recorder sees ("D:").
     Drive,
+    /// "", a host name ("example.com") or an IPv4 address.
+    Host,
 }
 
 pub struct Field {
@@ -330,6 +332,38 @@ pub static FIELDS: &[Field] = &[
         kind: Kind::Range { min: 50, max: 100, step: 5, unit: "%" },
         default: || Value::Int(90),
     },
+    Field {
+        key: "ping_warn",
+        group: "Alerts",
+        label: "Ping slow, 5-minute average: orange from",
+        help: "The round trip to the address pinged (Ping, below).",
+        kind: Kind::Range { min: 10, max: 1000, step: 10, unit: "ms" },
+        default: || Value::Int(100),
+    },
+    Field {
+        key: "ping_crit",
+        group: "Alerts",
+        label: "Ping slow: red from",
+        help: "",
+        kind: Kind::Range { min: 10, max: 1000, step: 10, unit: "ms" },
+        default: || Value::Int(250),
+    },
+    Field {
+        key: "loss_warn",
+        group: "Alerts",
+        label: "Packet loss over 5 minutes: orange from",
+        help: "Echoes to the address pinged that never came back within a second.",
+        kind: Kind::Range { min: 1, max: 50, step: 1, unit: "%" },
+        default: || Value::Int(2),
+    },
+    Field {
+        key: "loss_crit",
+        group: "Alerts",
+        label: "Packet loss: red from",
+        help: "",
+        kind: Kind::Range { min: 1, max: 50, step: 1, unit: "%" },
+        default: || Value::Int(10),
+    },
     // Desktop card: what it shows and how (sent with /api/card as "card"). Its place and size are
     // the card's own: it is dragged and resized on the desktop.
     Field {
@@ -387,6 +421,14 @@ pub static FIELDS: &[Field] = &[
         help: "",
         kind: Kind::Bool,
         default: || Value::Bool(true),
+    },
+    Field {
+        key: "card_ping",
+        group: "Desktop card",
+        label: "Ping tile",
+        help: "Across the card it has room for a wider chart of the last hour. Click the address on it to ping another one.",
+        kind: Kind::Choice(&[(2, "across the card"), (1, "like the other tiles"), (0, "not shown")]),
+        default: || Value::Int(2),
     },
     Field {
         key: "card_columns",
@@ -451,6 +493,31 @@ pub static FIELDS: &[Field] = &[
         help: "Dragging and resizing are off; a click still opens the dashboards.",
         kind: Kind::Bool,
         default: || Value::Bool(false),
+    },
+    // Ping: what the recorder pings once a second (ping.rs).
+    Field {
+        key: "ping_target",
+        group: "Ping",
+        label: "Ping",
+        help: "One small packet a second (as the ping command), to see how fast and how reliably the internet answers. Nothing else leaves this PC. Also from the card: click the address on its Ping tile.",
+        kind: Kind::Choice(&[(1, "Cloudflare (1.1.1.1)"), (2, "Google (8.8.8.8)"), (3, "Quad9 (9.9.9.9)"), (4, "your router"), (5, "another address"), (0, "off")]),
+        default: || Value::Int(1),
+    },
+    Field {
+        key: "ping_host",
+        group: "Ping",
+        label: "Another address",
+        help: "A name (example.com) or an IPv4 address, pinged when Ping is set to another address. The card keeps the last one typed here in its menu.",
+        kind: Kind::Host,
+        default: || Value::Text(String::new()),
+    },
+    Field {
+        key: "ping_router",
+        group: "Ping",
+        label: "Ping your router too",
+        help: "A dashed line under the address's: when only the address is slow or loses packets, the trouble is past your router (your provider, or the address itself); when the router does too, it is your Wi-Fi or cable.",
+        kind: Kind::Bool,
+        default: || Value::Bool(true),
     },
     // Process list: the desktop widget of every process, next to the card (sent with /api/card as
     // "processes"). Its place, size, opacity and sort are its own: set on the desktop.
@@ -622,6 +689,18 @@ pub static RULES: &[Rule] = &[
         b: "gpu_temp_crit",
         text: "Orange must start below red.",
     },
+    Rule {
+        a: "ping_warn",
+        rel: Rel::Lt,
+        b: "ping_crit",
+        text: "Orange must start below red.",
+    },
+    Rule {
+        a: "loss_warn",
+        rel: Rel::Lt,
+        b: "loss_crit",
+        text: "Orange must start below red.",
+    },
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -637,6 +716,25 @@ fn index(key: &str) -> Option<usize> {
 fn is_drive(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() == 2 && b[0].is_ascii_uppercase() && b[1] == b':'
+}
+
+/// A host name as DNS allows it (labels of letters, digits and hyphens, not at either end), its
+/// last label not all digits (Windows would read "1.2.3" as an address, 1.2.0.3).
+fn is_host_name(s: &str) -> bool {
+    s.len() <= 253
+        && !s
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+        && s.split('.').all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+        })
 }
 
 /// The value `text` gives for field `f`, if valid on its own.
@@ -674,6 +772,17 @@ fn parse(f: &Field, text: &str) -> Result<Value, String> {
                 Ok(Value::Text(t))
             } else {
                 Err("must be a drive such as C:".into())
+            }
+        }
+        Kind::Host => {
+            let t = text.trim_end_matches('.').to_ascii_lowercase();
+            if t.is_empty() || t.parse::<std::net::Ipv4Addr>().is_ok() || is_host_name(&t) {
+                Ok(Value::Text(t))
+            } else {
+                Err(
+                    "must be a name such as example.com or an IPv4 address such as 192.0.2.1"
+                        .into(),
+                )
             }
         }
     }
@@ -741,6 +850,9 @@ impl Settings {
         if let Some(r) = next.broken() {
             return Err((r.b.to_string(), r.text.to_string()));
         }
+        if next.int("ping_target") == 5 && next.text("ping_host").is_empty() {
+            return Err(("ping_host".into(), "Type the address to ping.".into()));
+        }
         Ok(next)
     }
 
@@ -773,6 +885,11 @@ impl Settings {
                 let i = index(k).unwrap_or(0);
                 s.values[i] = (FIELDS[i].default)();
             }
+        }
+        if s.int("ping_target") == 5 && s.text("ping_host").is_empty() {
+            problems.push("ping_target: another address, but none typed; default kept".into());
+            let i = index("ping_target").unwrap_or(0);
+            s.values[i] = (FIELDS[i].default)();
         }
         (s, problems)
     }
@@ -887,6 +1004,11 @@ impl Settings {
                         }
                         key(&mut o, "unit", false);
                         string(&mut o, unit);
+                    }
+                    Kind::Host => {
+                        string(&mut o, "text");
+                        key(&mut o, "placeholder", false);
+                        string(&mut o, "example.com");
                     }
                     Kind::Drive => {
                         string(&mut o, "choice");
@@ -1067,7 +1189,7 @@ mod tests {
                 Kind::Bool => {
                     s.flag(f.key);
                 }
-                Kind::Drive => {
+                Kind::Drive | Kind::Host => {
                     s.text(f.key);
                 }
                 _ => {
@@ -1162,7 +1284,7 @@ mod tests {
         let mut o = String::from("{\"x\":0");
         s.write_card(&mut o);
         o.push('}');
-        assert_eq!(o, "{\"x\":0,\"card\":{\"cpu\":true,\"memory\":true,\"commit\":true,\"gpu\":false,\"disk\":true,\"network\":true,\"columns\":3,\"charts\":true,\"issue_lines\":6,\"top_apps\":true,\"status\":true,\"clock\":true,\"opacity\":60,\"locked\":false}}");
+        assert_eq!(o, "{\"x\":0,\"card\":{\"cpu\":true,\"memory\":true,\"commit\":true,\"gpu\":false,\"disk\":true,\"network\":true,\"ping\":2,\"columns\":3,\"charts\":true,\"issue_lines\":6,\"top_apps\":true,\"status\":true,\"clock\":true,\"opacity\":60,\"locked\":false}}");
         assert!(Settings::default()
             .with(&ch(&[("card_columns", "4")]))
             .is_err());
@@ -1172,6 +1294,35 @@ mod tests {
         assert!(Settings::default()
             .with(&ch(&[("card_issue_lines", "0")]))
             .is_ok());
+    }
+
+    #[test]
+    fn ping_address() {
+        let ok = |v: &str| Settings::default().with(&ch(&[("ping_target", "5"), ("ping_host", v)]));
+        assert_eq!(ok("Example.COM.").unwrap().text("ping_host"), "example.com");
+        assert_eq!(ok("192.0.2.1").unwrap().text("ping_host"), "192.0.2.1");
+        assert!(ok("nas").is_ok());
+        for bad in [
+            "exa mple.com",
+            "-a.com",
+            "a..b",
+            "http://x.com",
+            "x.com/path",
+            "1.2.3",
+            "256.1.1.1",
+            "12",
+        ] {
+            assert!(ok(bad).is_err(), "{bad}");
+        }
+        // Another address needs one; the others do not.
+        assert_eq!(ok("").unwrap_err().0, "ping_host");
+        assert!(Settings::default()
+            .with(&ch(&[("ping_target", "4")]))
+            .is_ok());
+        // A file asking for another address without one: the default target.
+        let (s, problems) = Settings::from_text("ping_target = 5\nping_host = \n");
+        assert_eq!(s.int("ping_target"), 1);
+        assert_eq!(problems.len(), 1);
     }
 
     #[test]

@@ -103,6 +103,7 @@ To work on them without touching the recorder, use the read-only `serve` mode wi
 | `pagefile.size` `.used` | System page file information | |
 | `disk.<C:>.active` `.read_bps` `.write_bps` `.reads` `.writes` `.read_latency` `.write_latency` `.read_time` `.write_time` `.queue` `.size` `.free` | LogicalDisk counters, volume space | Each drive letter. Latency is per operation: none when idle. Over longer periods the API weights it by operations (`*_time` = seconds waited per second). |
 | `net.<adapter>.rx_bps` `.tx_bps` `.bandwidth` `.rx_errors` `.tx_errors` `.rx_discards` `.tx_discards`, `net.rx_bps` `.tx_bps` | Network Interface counters | Each adapter, plus totals |
+| `ping.rtt` `.loss` `.jitter`, `ping.router_rtt` `.router_loss` | ICMP echo once a second (IcmpSendEcho), on threads of their own | The address the settings name (Ping), and the router (the default gateway); round trips and jitter in seconds, loss in % of the echoes of the sample |
 | `power.package` `.cores` | RAPL energy counters | CPU power in watts |
 | `gpu.util` `.mem_util` `.enc_util` `.dec_util` `.mem_used` `.mem_total` `.mem_reserved` `.temp` `.power` `.power_limit` `.clock_*` `.fan` `.pstate` `.slow_*` | NVML, in-process | `slow_*` is the % of time each slowdown reason was active |
 | `self.cpu` `.ws` `.private` `.collect` | This program | Its own cost, recorded like everything else |

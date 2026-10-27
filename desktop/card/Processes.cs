@@ -852,18 +852,20 @@ namespace Kymo
         }
     }
 
-    // The list's search, while typed in: a small window with a text box over the search field drawn on the list (the
-    // list itself never takes the keyboard: it stays under the windows in use). Typing searches at once; Enter or a click
-    // elsewhere closes it and keeps the search; Escape clears it.
+    // A small window with a text box over a field drawn on a widget (the widgets never take the keyboard: they stay under
+    // the windows in use). The list's search: typing searches at once (`changed`); Enter or a click elsewhere closes it
+    // and keeps the search; Escape clears it. The card's ping address (`entered`): taken on Enter only; Escape or a
+    // click elsewhere closes it and leaves the address as it was.
     sealed class SearchBox : Form
     {
         readonly TextBox box;
-        readonly Action<string> changed;
+        readonly Action<string> changed, entered;
         Font font;
 
-        public SearchBox(Action<string> changed)
+        public SearchBox(Action<string> changed, Action<string> entered = null)
         {
             this.changed = changed;
+            this.entered = entered;
             AutoScaleMode = AutoScaleMode.None;
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
@@ -871,7 +873,7 @@ namespace Kymo
             BackColor = Color.FromArgb(41, 44, 50);   // the field as drawn over the list's background
             box = new TextBox { BorderStyle = BorderStyle.None, BackColor = BackColor, ForeColor = Color.FromArgb(236, 239, 243) };
             Controls.Add(box);
-            box.TextChanged += delegate { changed(box.Text); };
+            box.TextChanged += delegate { if (this.entered == null) this.changed(box.Text); };
             box.KeyDown += (o, e) => { if (HandleKey(e.KeyData)) e.Handled = e.SuppressKeyPress = true; };
             Deactivate += delegate { Hide(); };
         }
@@ -901,8 +903,8 @@ namespace Kymo
         {
             switch (keys)
             {
-                case Keys.Escape: box.Text = ""; Hide(); return true;
-                case Keys.Enter: Hide(); return true;
+                case Keys.Escape: if (entered == null) box.Text = ""; Hide(); return true;
+                case Keys.Enter: Hide(); if (entered != null) entered(box.Text.Trim()); return true;
                 case Keys.Control | Keys.A: box.SelectAll(); return true;
                 case Keys.Control | Keys.Back: DeleteWord(false); return true;
                 case Keys.Control | Keys.Delete: DeleteWord(true); return true;
@@ -975,11 +977,11 @@ namespace Kymo
         readonly System.Windows.Forms.Timer opacitySave = new System.Windows.Forms.Timer { Interval = 1000 };
         string marked;                                // the row whose menu is open: drawn highlighted
         string query = "";                            // the search: only the processes it finds are listed
+        float drawnK = 1;                             // the scale last drawn at (the monitor's and the list's size)
         SearchBox searchBox;                          // where the search is typed, over its field (while typed in)
         ProcRow pressedRow;                           // under the mouse when the right button went down
         bool busy;                                    // a menu, or a question after it, is open
         readonly List<string> later = new List<string>();   // messages that came while one was open
-        NativeWindow menuOwner;                       // owns the menu and the questions after it: never shown
         static readonly int ownPid = Process.GetCurrentProcess().Id;
         readonly System.Windows.Forms.Timer reread = new System.Windows.Forms.Timer { Interval = 600 };   // after an action
 
@@ -1039,6 +1041,7 @@ namespace Kymo
         protected override Bitmap Render(float k, double wider, double taller)
         {
             var rows = ProcTable.Rows(reading, look.Group, Sort, SortUp, open, query);
+            drawnK = k;
             var bmp = ProcTable.Render(reading, rows, Columns, Sort, SortUp, open, first, k, wider, taller, Opacity2, ram, hits, scrollLook, marked, query);
             first = hits.First;
             if (searchBox != null && searchBox.Visible) searchBox.Bounds = OnScreen(hits.SearchText);   // the list moved or grew
@@ -1180,19 +1183,6 @@ namespace Kymo
                 Flush();
                 bool whole;
                 if (id == 0 || ProcMenu.Action(id, false, out whole) != null) ProcMenu.GiveBack(MenuOwner, before);
-            }
-        }
-
-        IntPtr MenuOwner
-        {
-            get
-            {
-                if (menuOwner == null)
-                {
-                    menuOwner = new NativeWindow();
-                    menuOwner.CreateHandle(new CreateParams { Style = unchecked((int)0x80000000), ExStyle = 0x80 });   // WS_POPUP, WS_EX_TOOLWINDOW
-                }
-                return menuOwner.Handle;
             }
         }
 
@@ -1407,7 +1397,7 @@ namespace Kymo
         void OpenSearch()
         {
             if (searchBox == null) searchBox = new SearchBox(Find);
-            searchBox.Open(OnScreen(hits.SearchText), ProcTable.SmallPx * scale, query);
+            searchBox.Open(OnScreen(hits.SearchText), ProcTable.SmallPx * drawnK, query);
         }
 
         Rectangle OnScreen(RectangleF r)
@@ -1432,7 +1422,6 @@ namespace Kymo
             if (opacitySave.Enabled) { opacitySave.Stop(); SaveSpot("opacity " + Opacity2 + " %"); }
             sampler.Dispose();
             reread.Dispose();
-            if (menuOwner != null) menuOwner.DestroyHandle();
             base.OnFormClosed(e);
         }
 

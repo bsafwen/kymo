@@ -23,6 +23,9 @@ It was written to replace a stack of four services (windows_exporter, nvidia_gpu
 - **Live status card**, top right at first:
   - a green **ALL GOOD** bar, or orange or red **N ISSUES** with one line per problem and the app most responsible;
   - six tiles, each with the last 30 seconds and the last hour: CPU, memory, commit, GPU, disk C: and network;
+  - **Ping**, across the card: how fast the address it pings answers (one small packet a second, as the ping command; Cloudflare's 1.1.1.1 at first), the jitter and the packets lost over 5 minutes, the best and worst of the hour, and the last hour's chart with your router's round trip dashed under it and a red mark for each minute that lost packets. When it turns orange or red, a note beside the value says whether the router answers well (the trouble is past your router: your provider, or the address) or not (your Wi-Fi or cable). An address that never answered (some servers ignore ping) says so and raises no issue.
+    - **Click the address** on it for the addresses to choose from (Cloudflare, Google, Quad9, your router, the one typed last), or *Another address…*: type a name or an IPv4 address over it and press Enter (Escape leaves it as it was).
+    - It can also be one tile like the others, or not shown (Settings page, Desktop card); what is pinged is under Ping there.
   - the top apps by CPU and memory, and whether recording is OK. *Memory Compression* is never the top app by memory: it holds other apps' memory, compressed when RAM runs short (Task Manager leaves it out of its Processes tab too).
   - It updates with each new sample (every 10 s by default), or every 30 s after 5 minutes without input. It pauses while it is covered, the PC is locked or the screen is off.
   - **Show desktop** (Win+D) brings it to the front.
@@ -66,6 +69,8 @@ It was written to replace a stack of four services (windows_exporter, nvidia_gpu
   | Free space on the card's disk (C: unless set otherwise) | under 25 GB | under 10 GB |
   | Disk latency, 5 min | 50 ms | 200 ms |
   | GPU temperature | 78 °C | 83 °C |
+  | Ping, 5-minute average | 100 ms | 250 ms |
+  | Packets lost, 5 min | 2 % | 10 % |
 
   Also flagged:
   - the disk busy over 90 % for 5 minutes;
@@ -93,7 +98,7 @@ It was written to replace a stack of four services (windows_exporter, nvidia_gpu
 
 ## The dashboards
 http://127.0.0.1:21223 has four pages.
-- **This PC:** the right-now tiles, then CPU (overall, per logical processor, clocks, power and limit), memory, disks, network, GPU, and the recorder's own coverage and cost.
+- **This PC:** the right-now tiles, then CPU (overall, per logical processor, clocks, power and limit), memory, disks, network (with the ping: round trip, your router's, packets lost), GPU, and the recorder's own coverage and cost.
 - **Apps:** the busiest apps by CPU, memory, I/O and commit, and a table of every app in the range. *Memory Compression* is left out of the memory and commit charts (it holds other apps' memory, compressed); the table still lists it, marked as such.
 - **Process explorer:** pick apps to see their CPU, memory, commit, I/O and instances over time.
 - **Settings:** see below.
@@ -113,7 +118,8 @@ http://127.0.0.1:21223/#/settings. Every field offers only valid values, each sh
 | Recording | how often the PC is read (1 s to 1 min, always a divisor of a minute); each logical processor, each network adapter, the NVIDIA GPU, CPU power and apps on or off | every 10 s, all on |
 | Retention | how long each tier is kept; a ceiling for the whole history (when it is reached the oldest files go first: samples, then apps per minute, minutes, apps per hour, hours) | samples 90 days, 1-minute summaries 2 years, hourly 10 years, apps per minute 6 months, apps per hour 10 years; 10 GB |
 | Alerts | the orange and red thresholds of the card and the tiles (table above) | as above |
-| Desktop card | each of the six tiles on or off; the disk it shows; 1, 2 or 3 tiles per row; the last-hour charts; how many issue lines (0 to 6, red ones first); the top apps line, the status line and the clock; background opacity (40 to 100 %); lock its place and size | all tiles; the system drive; 2 per row; charts on; 6 lines; all lines and the clock on; 85 %; unlocked |
+| Desktop card | each of the six tiles on or off; the ping tile across the card, like the other tiles or not shown; the disk it shows; 1, 2 or 3 tiles per row; the last-hour charts; how many issue lines (0 to 6, red ones first); the top apps line, the status line and the clock; background opacity (40 to 100 %); lock its place and size | all tiles; the system drive; 2 per row; charts on; 6 lines; all lines and the clock on; 85 %; unlocked |
+| Ping | what is pinged once a second: Cloudflare (1.1.1.1), Google (8.8.8.8), Quad9 (9.9.9.9), your router, another address (a name or an IPv4 address) or off; your router too, as a baseline | Cloudflare; the router too |
 | Process list | shown on the desktop or not; the PID, CPU, memory, I/O, GPU, threads, handles and commit columns; one row per app; read every 1, 2 or 5 s; its place and size locked | shown; PID, CPU, memory, I/O and GPU; one row per app; every 2 s; not locked |
 | Display | how often the dashboards refresh | automatic |
 

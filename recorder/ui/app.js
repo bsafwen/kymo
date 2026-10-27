@@ -1060,7 +1060,8 @@ function pagePC() {
       c.free = new Chart(g, 'Free space', 'Free space and size per volume.', 8, { unit: 'bytes' });
 
       g = row(main, 'Network');
-      c.traffic = new Chart(g, 'Traffic', 'Bits per second received (up) and sent (down) per adapter; disconnected adapters are hidden.', 16, { unit: 'bps' });
+      c.traffic = new Chart(g, 'Traffic', 'Bits per second received (up) and sent (down) per adapter; disconnected adapters are hidden.', 8, { unit: 'bps' });
+      c.ping = new Chart(g, 'Ping', 'Round trip to the address pinged (Settings, Ping) and to your router (dashed). Right axis: packets lost. When only the address is slow or loses packets, the trouble is past your router.', 8, { unit: 'ms', rightUnit: 'percent', rightRange: { min: 0, max: 100 } });
       c.neterr = new Chart(g, 'Errors and drops', 'Should stay at zero; anything else points at a cable, driver or Wi-Fi problem.', 8, { unit: 'pps' });
 
       g = row(main, 'GPU');
@@ -1089,7 +1090,7 @@ function pagePC() {
         'mem.committed', 'mem.commit_limit', 'mem.pages_in', 'mem.pages_out', 'mem.pool_*', 'pagefile.*',
         'disk.*.read_bps', 'disk.*.write_bps', 'disk.*.reads', 'disk.*.writes', 'disk.*.read_latency', 'disk.*.write_latency',
         'disk.*.active', 'disk.*.queue', 'disk.*.free', 'disk.*.size',
-        'net.*.rx_bps', 'net.*.tx_bps', 'net.*.bandwidth', 'net.*.*_errors', 'net.*.*_discards',
+        'net.*.rx_bps', 'net.*.tx_bps', 'net.*.bandwidth', 'net.*.*_errors', 'net.*.*_discards', 'ping.*',
         'gpu.*util', 'gpu.mem_used', 'gpu.mem_total', 'gpu.temp', 'gpu.fan', 'gpu.power', 'gpu.power_limit',
         'gpu.clock_graphics', 'gpu.clock_mem', 'gpu.slow_*',
         'self.cpu', 'self.private', 'self.data', 'self.collect'];
@@ -1147,6 +1148,8 @@ function pagePC() {
         .filter(n => (max(A(`net.${n}.bandwidth`)) || 0) > 0).sort();
       c.traffic.set(G, r, nics.flatMap((n, i) => [S(`${n} in`, times(A(`net.${n}.rx_bps`), 8), PALETTE[i]),
         S(`${n} out`, times(A(`net.${n}.tx_bps`), 8), PALETTE[i], { neg: true })]));
+      c.ping.set(G, r, [S('round trip', times(A('ping.rtt'), 1000), C.green), S('your router', times(A('ping.router_rtt'), 1000), C.blue, { dash: true }),
+        S('lost %', A('ping.loss'), C.red, { right: true, fill: 0 })]);
       const sum2 = (a, b) => combine((x, y) => x + y, a, b);
       c.neterr.set(G, r, nics.flatMap((n, i) => [S(`${n} errors`, sum2(A(`net.${n}.rx_errors`), A(`net.${n}.tx_errors`)), PALETTE[i]),
         S(`${n} discarded`, sum2(A(`net.${n}.rx_discards`), A(`net.${n}.tx_discards`)), PALETTE[i], { dash: true })]));
@@ -1384,6 +1387,7 @@ function fieldValues(f) {
 const holds = (rule, v) => (rule.rel === 'le' ? v[rule.a] <= v[rule.b] : rule.rel === 'lt' ? v[rule.a] < v[rule.b] : v[rule.a] > v[rule.b]);
 function valueLabel(f, v) {
   if (f.kind === 'bool') return v ? 'on' : 'off';
+  if (f.kind === 'text') return v || 'none';
   if (f.kind === 'range') return `${v} ${f.unit}`;
   const c = f.choices.find(x => x.value === v);
   return c ? c.label : String(v);
@@ -1452,7 +1456,7 @@ function pageSettings() {
     for (const [k, x] of hand) {
       const f = byKey(k);
       let res = settle(schema, v, k, x);
-      if (!res && f.kind !== 'bool') {
+      if (!res && fieldValues(f)) {
         // Not possible as asked: the nearest value of this field that is.
         for (const y of fieldValues(f).slice().sort((a, b) => Math.abs(a - x) - Math.abs(b - x))) {
           res = settle(schema, v, k, y);
@@ -1605,6 +1609,10 @@ function pageSettings() {
       r.addEventListener('input', () => { out.textContent = valueLabel(f, Number(r.value)); });
       r.addEventListener('change', () => change(f.key, Number(r.value)));
       input = el('span', { class: 'range' }, r, out);
+    } else if (f.kind === 'text') {
+      // Taken when it is left or on Enter; the recorder checks it, and says what is wrong.
+      input = el('input', { type: 'text', value: v, placeholder: f.placeholder || '', spellcheck: 'false', disabled: off ? '' : null });
+      input.addEventListener('change', () => change(f.key, input.value.trim()));
     } else {
       input = el('select', { disabled: off ? '' : null });
       for (const c of f.choices) input.append(el('option', { value: String(c.value), text: c.label }));

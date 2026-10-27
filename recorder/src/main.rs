@@ -27,6 +27,7 @@ mod import;
 mod json;
 mod logfile;
 mod pdh;
+mod ping;
 mod procs;
 mod query;
 mod service;
@@ -91,6 +92,13 @@ fn drive_of(s: &Settings) -> String {
         "" => card::system_drive(),
         d => d.to_string(),
     }
+}
+
+/// What to ping, from the settings: the target, and the router too unless it is the target.
+fn ping_of(s: &Settings) {
+    let target = ping::target_of(s.int("ping_target"), s.text("ping_host"));
+    let router = s.flag("ping_router") && s.int("ping_target") != 4;
+    ping::configure(target, router);
 }
 
 fn load_settings(data: &Path) -> Settings {
@@ -276,6 +284,7 @@ fn run(data: PathBuf, port: u16, ui_dir: Option<PathBuf>, stop: &AtomicBool) -> 
         }
     }
     let mut sampler = system::Sampler::new(sources_of(&cfg));
+    ping_of(&cfg);
     shared.gpu.store(sampler.has_gpu(), Ordering::Relaxed);
     shared
         .counters
@@ -357,6 +366,7 @@ fn run(data: PathBuf, port: u16, ui_dir: Option<PathBuf>, stop: &AtomicBool) -> 
                             last = None; // rates start afresh at the new pace
                         }
                         sampler.configure(sources_of(&new));
+                        ping_of(&new);
                         if keep_of(&new) != keep_of(&cfg) {
                             store.set_keep(keep_of(&new));
                             if retention_hold {
@@ -455,6 +465,7 @@ fn run(data: PathBuf, port: u16, ui_dir: Option<PathBuf>, stop: &AtomicBool) -> 
         let retention_hold = clock_jumped || (stale_start && tick - start_tick < 7 * units::DAY_MS);
 
         let mut out = sampler.sample(t, dt, baseline);
+        ping::push_samples(&mut out.samples);
         system::push(
             &mut out.samples,
             "self.data",

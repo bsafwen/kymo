@@ -433,17 +433,13 @@ namespace Kymo
             foreach (var it in items)
             {
                 if (it.Text == null) { AppendMenuW(m, 0x800, IntPtr.Zero, null); continue; }   // MF_SEPARATOR
-                if (it.Sub != null)
-                {
-                    IntPtr sub = Build(it.Sub);
-                    AppendMenuW(m, 0x10, sub, it.Text);   // MF_POPUP
-                    var radio = it.Sub.Where(s => s.Radio).ToList();
-                    var on = radio.FirstOrDefault(s => s.Checked);
-                    if (on != null) CheckMenuRadioItem(sub, (uint)radio.First().Id, (uint)radio.Last().Id, (uint)on.Id, 0);   // MF_BYCOMMAND
-                    continue;
-                }
+                if (it.Sub != null) { AppendMenuW(m, 0x10, Build(it.Sub), it.Text); continue; }   // MF_POPUP
                 AppendMenuW(m, (it.Checked && !it.Radio ? 0x8u : 0u) | (it.Grayed ? 0x1u : 0u), (IntPtr)it.Id, it.Text);   // MF_CHECKED, MF_GRAYED
             }
+            // The radio dot on the checked one of its radio entries (their Ids follow each other).
+            var radio = items.Where(s => s.Radio && s.Text != null).ToList();
+            var on = radio.FirstOrDefault(s => s.Checked);
+            if (on != null) CheckMenuRadioItem(m, (uint)radio.First().Id, (uint)radio.Last().Id, (uint)on.Id, 0);   // MF_BYCOMMAND
             return m;
         }
 

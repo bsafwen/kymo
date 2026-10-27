@@ -958,6 +958,9 @@ fn card(shared: &Shared, root: &Path) -> String {
     cfg.write_limits(&mut o);
     cfg.write_card(&mut o);
     cfg.write_procs(&mut o);
+    if shared.recording {
+        crate::ping::write_card(&mut o, cfg.int("ping_target"), cfg.text("ping_host"));
+    }
     let head = |o: &mut String, status: &str, ts: i64| {
         key(o, "status", false);
         string(o, status);
@@ -987,7 +990,7 @@ fn card(shared: &Shared, root: &Path) -> String {
         o.push('}');
         return o;
     }
-    let s = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = shared.state.lock().unwrap_or_else(|e| e.into_inner());
     let status = if s.ts == 0 {
         if win::awake_ms() - shared.started_awake < grace {
             "starting"
@@ -1040,6 +1043,7 @@ fn card(shared: &Shared, root: &Path) -> String {
     if s.ts > now + 15_000 {
         card::Recent::default().write(&mut o, t_ref, false);
     } else {
+        s.recent.ping_since = crate::ping::changed_at();
         s.recent.write(&mut o, t_ref, fresh(s.ts, now));
     }
     o.push('}');
